@@ -181,3 +181,62 @@ def test_overlap_across_iterations_checks_same_owner_clock(mode, expected):
     report = compare_traces(reference, candidate)
     assert report["status"] == expected
     assert report["candidate"]["same_rank_train_decode_overlap_s"] == pytest.approx([0.1])
+
+
+@pytest.mark.parametrize("field,value", [("policy", 1), ("op", "read"), ("key", "different")])
+def test_io_identity_cannot_change_at_actual_completion(field, value):
+    reference = envelope()
+    base = {
+        "rank": 0,
+        "iteration": 0,
+        "io_id": 0,
+        "op": "write",
+        "kind": "kv",
+        "key": "prefix",
+        "request": 0,
+        "policy": 0,
+        "bytes": 128,
+        "actual_s": 0.1,
+    }
+    reference["events"] = [
+        {**base, "event": name, "t_s": t} for name, t in (("io_begin", 0.1), ("io_actual_end", 0.2), ("io_end", 0.2))
+    ]
+    candidate = copy.deepcopy(reference)
+    candidate["provenance"]["run_id"] = "corrupt"
+    candidate["events"][1][field] = value
+    assert compare_traces(reference, candidate)["status"] == "causal_violation"
+
+
+def test_declared_real_trace_without_lifecycle_coverage_is_inconclusive():
+    reference = envelope([profile_record() for _ in range(20)])
+    reference["provenance"]["kind"] = "verl"
+    candidate = copy.deepcopy(reference)
+    candidate["provenance"].update(run_id="holdout", kind="poc")
+    assert compare_traces(reference, candidate)["status"] == "inconclusive_coverage"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"clock": "unaligned_wall_clock"},
+        {"kind": "unknown"},
+        {"run_id": ""},
+    ],
+)
+def test_invalid_trace_provenance_is_rejected(change):
+    data = envelope()
+    data["provenance"].update(change)
+    with pytest.raises(ValueError, match="provenance"):
+        make_profile(data)
+
+
+def test_profile_rejects_prefix_identity_with_different_lengths():
+    with pytest.raises(ValueError, match="geometry"):
+        make_profile(envelope([profile_record(), profile_record(prefix_tokens=4)]))
+
+
+def test_duplicate_request_identity_is_rejected():
+    data = envelope()
+    data["requests"].append(data["requests"][0])
+    with pytest.raises(ValueError, match="duplicate"):
+        make_profile(data)

@@ -5,7 +5,7 @@ import time
 import pytest
 from test_agentrl import run, tiny
 
-from kv_cache.agentrl import SyncLifecycle
+from kv_cache.agentrl import AgentRLConfig, SyncLifecycle
 
 
 def test_io_arrivals_have_sizes_identity_and_distinct_actual_completion(tmp_path):
@@ -55,3 +55,8 @@ def test_kv_lifetime_accounts_shared_prefix_once_and_excludes_startup(tmp_path):
     begin = next(e["t_s"] for e in runner.trace.events if e["event"] == "iteration_begin")
     end = next(e["t_s"] for e in runner.trace.events if e["event"] == "iteration_end")
     assert rank["iteration_elapsed_s"] == pytest.approx(end - begin)
+
+
+def test_default_config_retains_v01_checkpoint_fingerprint():
+    # Captured directly from fork revision 1573ea6, before profile/capacity fields.
+    assert AgentRLConfig().fingerprint == "730cbd4d5532f15f6b4d44d76c8966c0e97e7565cf0b9b36cea0fea7c0b5c7de"

@@ -24,7 +24,11 @@ def digest(trace):
 
 def number(value, name, *, integer=False, minimum=0):
     types = (int,) if integer else (int, float)
-    if type(value) not in types or not math.isfinite(value) or value < minimum:
+    try:
+        valid = type(value) in types and math.isfinite(value) and value >= minimum
+    except OverflowError:
+        valid = False
+    if not valid:
         raise ValueError(f"invalid {name}")
 
 
@@ -92,7 +96,12 @@ def validate_profile(profile):
 
 
 def validate_trace(trace):
-    if not isinstance(trace, dict) or trace.get("schema_version") != 1 or trace.get("mode") not in MODES:
+    if (
+        not isinstance(trace, dict)
+        or type(trace.get("schema_version")) is not int
+        or trace.get("schema_version") != 1
+        or trace.get("mode") not in MODES
+    ):
         raise ValueError("unsupported trace schema/mode")
     provenance = trace.get("provenance", {})
     if (
@@ -138,6 +147,11 @@ def validate_trace(trace):
             number(event.get("bytes"), "I/O bytes", integer=True)
             if event.get("op") not in ("read", "write", "delete") or not isinstance(event.get("kind"), str):
                 raise ValueError("invalid I/O operation")
+            if not isinstance(event.get("key"), str):
+                raise ValueError("I/O key missing")
+            number(event.get("policy"), "I/O policy", integer=True)
+            if event.get("request") is not None:
+                number(event["request"], "I/O request", integer=True)
             if event["event"] == "io_end":
                 number(event.get("actual_s"), "actual I/O latency")
         if event["event"] == "rollout_start":
@@ -230,6 +244,11 @@ def analyze_trace(trace):
         begin, actual, end = (pairs[k] for k in ("io_begin", "io_actual_end", "io_end"))
         if not begin["t_s"] <= actual["t_s"] <= end["t_s"] or len({e["bytes"] for e in pairs.values()}) != 1:
             violations.append(f"I/O boundary mismatch {identity}")
+        if any(
+            len({e.get(k) for e in pairs.values()}) != 1
+            for k in ("op", "kind", "key", "request", "policy", "iteration")
+        ):
+            violations.append(f"I/O identity mismatch {identity}")
     for identity, events in grouped.items():
         events.sort(key=lambda e: e["t_s"])
 
@@ -284,6 +303,8 @@ def analyze_trace(trace):
 
 
 def compare_traces(reference, candidate, *, relative_tolerance=0.25, ks_tolerance=0.3):
+    validate_trace(reference)
+    validate_trace(candidate)
     for value in (relative_tolerance, ks_tolerance):
         number(value, "comparison tolerance")
     if reference["mode"] != candidate["mode"]:
@@ -330,6 +351,16 @@ def compare_traces(reference, candidate, *, relative_tolerance=0.25, ks_toleranc
         or source_sha == candidate["provenance"].get("calibration_sha256")
     )
     status = "within_tolerances" if passed else "outside_tolerances"
+    required = {"generation_begin", "generation_end", "rollout_complete", "train_begin", "train_end", "policy_install"}
+    coverage = {
+        name: {
+            "observed_events": sorted({e["event"] for e in trace["events"]}),
+            "missing_lifecycle_boundaries": sorted(required - {e["event"] for e in trace["events"]}),
+        }
+        for name, trace in (("reference", reference), ("candidate", candidate))
+    }
+    if reference["provenance"]["kind"] == "verl" and any(v["missing_lifecycle_boundaries"] for v in coverage.values()):
+        status = "inconclusive_coverage"
     if reference["provenance"]["kind"] == "verl" and min(len(reference["requests"]), len(candidate["requests"])) < 20:
         status = "inconclusive_sample_size"
     if reused:
@@ -348,6 +379,7 @@ def compare_traces(reference, candidate, *, relative_tolerance=0.25, ks_toleranc
         "reference": left,
         "candidate": right,
         "metrics": comparisons,
+        "coverage": coverage,
         "limitations": [
             "Thresholds must be registered before an independent holdout run.",
             "No aligned cross-rank concurrency or device/wire traffic is inferred.",

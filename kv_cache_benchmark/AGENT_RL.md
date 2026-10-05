@@ -161,6 +161,8 @@ No cross-rank concurrency is inferred.
 
 The default thresholds are illustrative and must be registered before an independent holdout run.
 Reusing the calibration source or run ID is reported as inconclusive; fixture comparisons never establish real Agent RL fidelity.
+Declared real traces without generation/completion/training/policy boundaries are also inconclusive; reports list observed and missing boundaries.
+Arrival, actual completion and request-visible completion must retain the same operation/key/request/policy identity.
 Reports always set `real_validation: false`: distribution agreement is evidence to review with coverage, instrumentation and controlled interventions, not certification.
 Checkpoint-only recovery at the final iteration produces no completed requests and therefore no normalized request trace.
 
