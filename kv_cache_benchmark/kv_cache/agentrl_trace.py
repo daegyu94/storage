@@ -219,6 +219,8 @@ def analyze_trace(trace):
             metrics[f"{event['kind']}_{event['op']}_latency_s"].append(event["actual_s"])
         if name == "rollout_start":
             metrics["admission_wait_s"].append(event["queue_wait_s"])
+        if name == "generation_begin" and "compute_queue_wait_s" in event:
+            metrics["compute_queue_wait_s"].append(event["compute_queue_wait_s"])
         if name == "io_actual_end" and "kv_live_payload_bytes" in event:
             metrics["kv_live_payload_bytes"].append(event["kv_live_payload_bytes"])
     for identity, pairs in ios.items():

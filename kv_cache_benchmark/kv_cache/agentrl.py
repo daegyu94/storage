@@ -27,6 +27,7 @@ from kv_cache.models import ModelConfig
 class AgentRLConfig:
     trainer_mode: str = "sync"
     request_profile: dict | None = None
+    generation_rate_scope: str = "request"
     iterations: int = 2
     requests_per_rank: int = 4
     concurrency: int = 2
@@ -81,6 +82,8 @@ class AgentRLConfig:
     def validate(self):
         if self.trainer_mode != "sync":
             raise ValueError("v0.1 supports trainer_mode=sync only")
+        if self.generation_rate_scope not in ("request", "owner"):
+            raise ValueError("generation_rate_scope must be request or owner")
         if self.request_profile is not None:
             validate_profile(self.request_profile)
             if self.request_profile["mode"] != "sync":
@@ -222,6 +225,8 @@ class AgentRLConfig:
         values = asdict(self)
         if self.request_profile is None:
             values.pop("request_profile")  # Keep v0.1 checkpoint fingerprints compatible.
+        if self.generation_rate_scope == "request":
+            values.pop("generation_rate_scope")
         return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
@@ -438,7 +443,7 @@ class SyncLifecycle:
         }
 
     async def rollout(self, request, semaphore):
-        queued = time.monotonic()
+        queued = self.rollout_offered_at
         async with semaphore:
             self.active += 1
             self.active_peak = max(self.active_peak, self.active)
@@ -495,18 +500,7 @@ class SyncLifecycle:
             while remaining:
                 tokens = min(config.chunk_tokens, remaining)
                 delay = planned["decode_active_s"] * tokens / planned["generated_tokens"]
-                self.trace.emit(
-                    "generation_begin",
-                    request=request,
-                    tokens=tokens,
-                    policy=self.version,
-                    turn=turn,
-                    modeled_compute_s=delay,
-                )
-                started = time.monotonic()
-                await asyncio.sleep(delay)
-                active_s += time.monotonic() - started
-                self.trace.emit("generation_end", request=request, tokens=tokens, policy=self.version, turn=turn)
+                active_s += await self.generate(request, tokens, turn, delay)
                 size = kv_delta_bytes(history, tokens, config.bytes_per_token, config.kv_offload_fraction)
                 if size:
                     await self.io(
@@ -571,13 +565,49 @@ class SyncLifecycle:
             active=self.active - 1,
         )
 
+    async def generate(self, request, tokens, turn, delay):
+        queued = time.monotonic()
+        self.trace.emit("generation_queued", request=request, tokens=tokens, turn=turn, policy=self.version)
+        if self.config.generation_rate_scope == "owner":
+            factor = self.config.rank_rate_factors[self.rank % len(self.config.rank_rate_factors)]
+            delay = max(delay, tokens / (self.config.tokens_per_second * factor))
+
+        async def service():
+            started = time.monotonic()
+            self.trace.emit(
+                "generation_begin",
+                request=request,
+                tokens=tokens,
+                turn=turn,
+                policy=self.version,
+                modeled_compute_s=delay,
+                compute_queue_wait_s=started - queued,
+            )
+            await asyncio.sleep(delay)
+            active_s = time.monotonic() - started
+            self.trace.emit("generation_end", request=request, tokens=tokens, turn=turn, policy=self.version)
+            return active_s
+
+        if self.config.generation_rate_scope == "owner":
+            async with self.decode_lock:
+                return await service()
+        return await service()
+
     async def rollouts(self):
+        self.rollout_offered_at = time.monotonic()
+        self.decode_lock = asyncio.Lock()  # Each iteration uses a fresh asyncio.run loop.
         self.trace.emit("rollout_phase_begin", policy=self.version)
         semaphore = asyncio.Semaphore(self.config.concurrency)
+        requests = iter(range(self.config.requests_per_rank))
+
+        async def worker():
+            for request in requests:
+                await self.rollout(request, semaphore)
+
         # TaskGroup drains/cancels peers on failure before the rank exchanges errors.
         async with asyncio.TaskGroup() as group:
-            for request in range(self.config.requests_per_rank):
-                group.create_task(self.rollout(request, semaphore))
+            for _ in range(min(self.config.concurrency, self.config.requests_per_rank)):
+                group.create_task(worker())
         self.trace.emit("rollout_phase_end", policy=self.version)
 
     @staticmethod
@@ -713,12 +743,25 @@ class SyncLifecycle:
                 value = totals.setdefault(name, {"ops": 0, "payload_bytes": 0})
                 value["ops"] += 1
                 value["payload_bytes"] += event["bytes"]
+        generated_tokens = sum(e["generated_tokens"] for e in self.trace.events if e["event"] == "rollout_complete")
+        rollout_s = sum(
+            end["t_s"] - begin["t_s"]
+            for begin, end in zip(
+                [e for e in self.trace.events if e["event"] == "rollout_phase_begin"],
+                [e for e in self.trace.events if e["event"] == "rollout_phase_end"],
+                strict=True,
+            )
+        )
         return {
             "rank": self.rank,
             "host": socket.gethostname(),
             "local_rank": os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", os.environ.get("MPI_LOCALRANKID", "0")),
             "active_peak": self.active_peak,
             "io_active_peak": self.io_active_peak,
+            "admission_worker_limit": min(self.config.concurrency, self.config.requests_per_rank),
+            "achieved_decode_tokens_per_s": generated_tokens / rollout_s if rollout_s else 0,
+            "compute_queue_wait_s": sum(e.get("compute_queue_wait_s", 0) for e in self.trace.events),
+            "modeled_decode_service_s": sum(e.get("modeled_compute_s", 0) for e in self.trace.events),
             "kv_live_payload_bytes": sum(self.kv_sizes.values()),
             "kv_peak_payload_bytes": self.kv_peak_bytes,
             "prefix_hits": sum(e["event"] == "prefix_hit" for e in self.trace.events),
