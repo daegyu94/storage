@@ -14,7 +14,9 @@ import socket
 import time
 import uuid
 from dataclasses import asdict, dataclass, field, fields
+from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -28,6 +30,7 @@ class AgentRLConfig:
     trainer_mode: str = "sync"
     request_profile: dict | None = None
     async_workload: dict | None = None
+    kv_cache_model: dict | None = None
     generation_rate_scope: str = "request"
     iterations: int = 2
     requests_per_rank: int = 4
@@ -231,6 +234,10 @@ class AgentRLConfig:
                 )
         if largest > self.max_payload_bytes:
             raise ValueError("payload exceeds max_payload_bytes; use smaller chunks or an explicit memory budget")
+        if self.kv_cache_model is not None:
+            from kv_cache.agentrl_kv import CacheSettings
+
+            CacheSettings.parse(self.kv_cache_model).validate(self)
 
     @property
     def bytes_per_token(self):
@@ -245,6 +252,8 @@ class AgentRLConfig:
             values.pop("generation_rate_scope")
         if self.async_workload is None:
             values.pop("async_workload")
+        if self.kv_cache_model is None:
+            values.pop("kv_cache_model")
         return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
@@ -306,6 +315,7 @@ class SyncLifecycle:
         self.kv_sizes = {}
         self.kv_peak_bytes = 0
         self.completed_requests = []
+        self.cache_pools = {}
 
     def gather_all(self, value):
         return self.comm.allgather(value) if self.comm else [value]
@@ -340,6 +350,8 @@ class SyncLifecycle:
         self.kv = self._backend(rank_dir / "kv")
         self.prompts = self._backend(rank_dir / "prompts")
         self.trajectories = self._backend(rank_dir / "trajectories")
+        if self.config.kv_cache_model is not None and self.config.trainer_mode == "sync":
+            self.cache_pools[self.rank] = self.make_cache_pool(self.rank, self.kv)
         steps = range(self.config.iterations) if self.config.request_profile else (0,)
         for iteration in steps:
             for request in range(self.config.requests_per_rank):
@@ -360,6 +372,98 @@ class SyncLifecycle:
 
     def io_context(self):
         return {}
+
+    def make_cache_pool(self, owner, backend):
+        from kv_cache.agentrl_kv import CacheSettings, KVPool
+
+        async def transfer(op, key, size, **context):
+            return await self.io(backend, op, key, size, kind="kv", owner=f"rollout-{owner}", role="rollout", **context)
+
+        def emit(name, **data):
+            self.trace.emit(
+                name, owner=f"rollout-{owner}", policy=self.version, **{k: v for k, v in data.items() if k != "policy"}
+            )
+
+        return KVPool(
+            CacheSettings.parse(self.config.kv_cache_model), self.config.bytes_per_token, owner, transfer, emit
+        )
+
+    def cached_event(self, name, state, **data):
+        context = {
+            "request": state.request,
+            "owner": f"rollout-{state.owner}",
+            "iteration": state.origin,
+            "policy": self.version,
+        }
+        if hasattr(state, "group"):
+            context["group"] = state.group
+        self.trace.emit(name, **{**context, **data})
+
+    async def cached_prepare(self, state, pool, lease):
+        if state.kv_version == self.version:
+            return
+        factor = self.config.rank_rate_factors[state.owner % len(self.config.rank_rate_factors)]
+        if state.kv_version is not None:
+            self.cached_event(
+                "rollout_resume", state, generated_tokens=state.generated, previous_policy=state.kv_version
+            )
+            self.cached_event("re_prefill_begin", state, history_tokens=state.history)
+            await asyncio.sleep(state.history / (self.config.prefill_tokens_per_second * factor))
+            pool.materialize(lease, state.history)
+            self.cached_event("re_prefill_end", state, history_tokens=state.history)
+        else:
+            prefix = lease.prefix_tokens
+            if prefix:
+                key = f"v{self.version}-o{state.owner}-prefix-{state.shape['prefix_id']}"
+                async with pool.prefix_locks.setdefault(key, asyncio.Lock()):
+                    hit = pool.prefix_ready(lease)
+                    self.cached_event(
+                        "prefix_hit" if hit else "prefix_miss", state, key=key, cache_prefix_tokens=prefix
+                    )
+                    if not hit:
+                        await asyncio.sleep(prefix / (self.config.prefill_tokens_per_second * factor))
+                        pool.materialize(lease, prefix, prefix_only=True)
+            suffix = state.history - prefix
+            if suffix:
+                await asyncio.sleep(suffix / (self.config.prefill_tokens_per_second * factor))
+            pool.materialize(lease, state.history)
+        state.kv_version = self.version
+
+    async def cached_step(self, state, tokens, compute=None):
+        pool = self.cache_pools[state.owner]
+        previous = state.history
+        async with pool.lease(
+            self.version,
+            state.request,
+            state.shape["prefix_id"],
+            state.shape["prefix_tokens"],
+            previous,
+            tokens,
+            iteration=state.origin,
+        ) as lease:
+            await self.cached_prepare(state, pool, lease)
+            result = await compute() if compute else None
+            pool.materialize(lease, previous + tokens)
+            return result
+
+    async def retire_cache_request(self, state):
+        pool = self.cache_pools.get(state.owner)
+        if pool:
+            keys = await pool.release_request(state.request)
+            await self.cache_retire_files(state, keys)
+
+    async def cache_retire_files(self, state, keys):
+        for key in keys:
+            await self.io(
+                self.kv,
+                "delete",
+                key,
+                kind="kv",
+                request=state.request,
+                policy=state.kv_version,
+                owner=f"rollout-{state.owner}",
+                role="gc",
+            )
 
     def io_completed(self, identity):
         pass
@@ -483,6 +587,10 @@ class SyncLifecycle:
             try:
                 await self.rollout_body(request, queued)
             finally:
+                if self.config.kv_cache_model is not None:
+                    await self.retire_cache_request(
+                        SimpleNamespace(owner=self.rank, request=request, kv_version=self.version)
+                    )
                 self.active -= 1
 
     async def rollout_body(self, request, queued):
@@ -503,7 +611,16 @@ class SyncLifecycle:
             self.prompts, "read", self.prompt_key(request, self.trace.iteration), kind="prompt", request=request
         )
         prefix_tokens = shape["prefix_tokens"]
-        if prefix_tokens:
+        cache_state = SimpleNamespace(
+            owner=self.rank,
+            request=request,
+            origin=self.trace.iteration,
+            shape=shape,
+            history=shape["prompt_tokens"],
+            generated=0,
+            kv_version=None,
+        )
+        if prefix_tokens and self.config.kv_cache_model is None:
             prefix_key = f"v{self.version}-prefix-{shape['prefix_id']}"
             lock = self.prefix_locks.setdefault(prefix_key, asyncio.Lock())
             prefix_bytes = kv_delta_bytes(0, prefix_tokens, config.bytes_per_token, config.kv_offload_fraction)
@@ -519,7 +636,7 @@ class SyncLifecycle:
                         await self.io(self.kv, "write", prefix_key, prefix_bytes, kind="kv", request=request)
                     self.prefixes.add(prefix_key)
         suffix = shape["prompt_tokens"] - prefix_tokens
-        if suffix:
+        if suffix and self.config.kv_cache_model is None:
             await asyncio.sleep(suffix / (config.prefill_tokens_per_second * factor))
             size = kv_delta_bytes(prefix_tokens, suffix, config.bytes_per_token, config.kv_offload_fraction)
             if size:
@@ -533,7 +650,13 @@ class SyncLifecycle:
             while remaining:
                 tokens = min(config.chunk_tokens, remaining)
                 delay = planned["decode_active_s"] * tokens / planned["generated_tokens"]
-                active_s += await self.generate(request, tokens, turn, delay)
+                if self.config.kv_cache_model is not None:
+                    cache_state.history, cache_state.generated = history, generated
+                    active_s += await self.cached_step(
+                        cache_state, tokens, partial(self.generate, request, tokens, turn, delay)
+                    )
+                else:
+                    active_s += await self.generate(request, tokens, turn, delay)
                 size = kv_delta_bytes(history, tokens, config.bytes_per_token, config.kv_offload_fraction)
                 if size:
                     await self.io(
@@ -555,6 +678,9 @@ class SyncLifecycle:
                 await asyncio.sleep(planned["tool_delay_s"])
                 tool_s = time.monotonic() - started
                 self.trace.emit("tool_end", request=request, turn=turn)
+                if self.config.kv_cache_model is not None:
+                    cache_state.history = history
+                    await self.cached_step(cache_state, planned["observation_tokens"])
                 size = kv_delta_bytes(
                     history, planned["observation_tokens"], config.bytes_per_token, config.kv_offload_fraction
                 )
@@ -785,6 +911,8 @@ class SyncLifecycle:
         self.trace.emit("recovery_end", policy=self.version)
 
     async def invalidate(self):
+        for pool in self.cache_pools.values():
+            pool.invalidate()
         for key in list(self.kv.metadata):
             await self.io(self.kv, "delete", key, kind="kv")
         self.prefixes.clear()
@@ -820,6 +948,11 @@ class SyncLifecycle:
             "modeled_decode_service_s": sum(e.get("modeled_compute_s", 0) for e in self.trace.events),
             "kv_live_payload_bytes": sum(self.kv_sizes.values()),
             "kv_peak_payload_bytes": self.kv_peak_bytes,
+            **(
+                {"kv_cache_model": {"owners": {str(owner): pool.summary() for owner, pool in self.cache_pools.items()}}}
+                if self.config.kv_cache_model is not None
+                else {}
+            ),
             "prefix_hits": sum(e["event"] == "prefix_hit" for e in self.trace.events),
             "prefix_misses": sum(e["event"] == "prefix_miss" for e in self.trace.events),
             "generated_tokens": sum(
@@ -897,7 +1030,15 @@ class SyncLifecycle:
         return {}
 
     def normalized_trace_fields(self):
-        return {}
+        if self.config.kv_cache_model is None:
+            return {}
+        return {
+            "kv_cache_model": {
+                "settings": self.config.kv_cache_model,
+                "residency_model": "chunk_safe_working_set",
+                "fidelity": "uncalibrated",
+            }
+        }
 
     def export_trace(self):
         return bool(self.completed_requests)
@@ -952,6 +1093,7 @@ class SyncLifecycle:
                             "agentrl.py",
                             "agentrl_async.py",
                             "agentrl_mpi.py",
+                            "agentrl_kv.py",
                             "agentrl_trace.py",
                             "backends.py",
                             "models.py",

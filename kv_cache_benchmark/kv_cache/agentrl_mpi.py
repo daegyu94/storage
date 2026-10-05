@@ -100,6 +100,9 @@ class Endpoint:
 
 
 class RoleEngine(AsyncLifecycle):
+    def cache_owner_active(self, owner):
+        return self.rank == owner + 1
+
     def configure_role(self, rank, run_id, roles):
         self.rank, self.trace = rank, Trace(rank)
         self.shared_run_id, self.roles = run_id, roles
@@ -119,7 +122,7 @@ class RoleEngine(AsyncLifecycle):
         return super().request_shape(request, iteration)
 
     def normalized_trace_fields(self):
-        return {"execution_role": self.execution_role}
+        return {**super().normalized_trace_fields(), "execution_role": self.execution_role}
 
     def export_trace(self):
         return True

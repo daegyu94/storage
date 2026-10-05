@@ -8,6 +8,7 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, fields
+from functools import partial
 
 from kv_cache.agentrl import SyncLifecycle, kv_delta_bytes, network_delay
 
@@ -159,6 +160,14 @@ class AsyncLifecycle(SyncLifecycle):
                     "prefix_locks": {},
                 }
             )
+            if self.config.kv_cache_model is not None and self.cache_owner_active(owner):
+                self.cache_pools[owner] = self.make_cache_pool(owner, self.owners[owner]["kv"])
+
+    def cache_owner_active(self, owner):
+        return True
+
+    async def cache_retire_files(self, state, keys):
+        self.queue_retirement([(state.owner, key) for key in keys])
 
     def event(self, name, state=None, **data):
         if state:
@@ -263,7 +272,8 @@ class AsyncLifecycle(SyncLifecycle):
             self.event("generation_end", state, tokens=tokens, turn=turn)
             state.first_version = self.version if state.first_version is None else state.first_version
             state.last_version = self.version
-        await self.write_tokens(state, state.history, tokens, f"decode-{state.generated}")
+        if self.config.kv_cache_model is None:
+            await self.write_tokens(state, state.history, tokens, f"decode-{state.generated}")
         state.history += tokens
         state.generated += tokens
         return duration
@@ -293,8 +303,13 @@ class AsyncLifecycle(SyncLifecycle):
                     while remaining:
                         tokens = min(remaining, self.config.chunk_tokens)
                         async with self.gate.section():
-                            await self.prepare_kv(state)
-                            active_s += await self.decode(state, tokens, turn, planned)
+                            if self.config.kv_cache_model is not None:
+                                active_s += await self.cached_step(
+                                    state, tokens, partial(self.decode, state, tokens, turn, planned)
+                                )
+                            else:
+                                await self.prepare_kv(state)
+                                active_s += await self.decode(state, tokens, turn, planned)
                         remaining -= tokens
                     tool_s = 0.0
                     if turn + 1 < len(state.shape["turns"]):
@@ -308,8 +323,13 @@ class AsyncLifecycle(SyncLifecycle):
                         tool_s = time.monotonic() - tool_start
                         self.event("tool_end", state, turn=turn)
                         async with self.gate.section():
-                            await self.prepare_kv(state)
-                            await self.write_tokens(state, state.history, planned["observation_tokens"], f"obs-{turn}")
+                            if self.config.kv_cache_model is not None:
+                                await self.cached_step(state, planned["observation_tokens"])
+                            else:
+                                await self.prepare_kv(state)
+                                await self.write_tokens(
+                                    state, state.history, planned["observation_tokens"], f"obs-{turn}"
+                                )
                             state.history += planned["observation_tokens"]
                     observed.append({**planned, "decode_active_s": active_s, "tool_delay_s": tool_s})
                 key = f"trajectory-g{state.group}-r{state.request}"
@@ -349,6 +369,8 @@ class AsyncLifecycle(SyncLifecycle):
                     active=self.active - 1,
                 )
             finally:
+                if self.config.kv_cache_model is not None:
+                    await self.retire_cache_request(state)
                 self.active -= 1
 
     def build_group(self, group, origin, owner):
@@ -470,6 +492,8 @@ class AsyncLifecycle(SyncLifecycle):
         self.event("rollout_pause_end", reason=reason, policy=self.version)
 
     def retire_kv(self):
+        for pool in self.cache_pools.values():
+            pool.invalidate()
         snapshot = []
         for owner, data in enumerate(self.owners):
             for key in list(data["kv"].metadata):
@@ -481,6 +505,12 @@ class AsyncLifecycle(SyncLifecycle):
             data["prefix_locks"].clear()
         if not snapshot:
             return
+        self.queue_retirement(snapshot)
+
+    def queue_retirement(self, snapshot):
+        if not snapshot:
+            return
+        self.retired.update(snapshot)
         retirement = self.retirement_sequence
         self.retirement_sequence += 1
         self.event(

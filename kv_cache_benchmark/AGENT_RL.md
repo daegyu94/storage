@@ -162,7 +162,8 @@ On a new policy, unfinished requests re-prefill their retained prompt/generated/
 CPU tool delays can continue while generation is paused; they still produce no sandbox filesystem traffic.
 Policy retirement makes old keys inaccessible immediately; `kv_gc_delay_s` delays physical delete of a frozen key snapshot.
 New policy keys remain independent of old GC, and run shutdown drains file operations before cleanup and reporting.
-Physical KV peak includes retired bytes until GC; no finite cache capacity or eviction policy is modeled.
+Physical KV peak includes retired bytes until GC.
+By default the legacy fraction model has no finite cache capacity; opt in to the working-set model below.
 
 Prompt age is `trainer_policy - prompt_policy + 1`.
 With `drop`, only terminal groups with age **greater than** the threshold are discarded.
@@ -182,6 +183,47 @@ Async `decoded_tokens` counts every completed decode chunk, including unfinished
 `generated_tokens` retains the completed-request total, and `unfinished_generated_tokens` records the difference.
 Async achieved decode rate uses all decoded tokens over the full rollout phase, including training/transition pauses and final GC.
 It is a workload wall-time rate, not measured GPU service throughput.
+
+## Capacity-driven KV storage
+
+The optional model below replaces unconditional fractional writes with logical resident pages and real write-back storage I/O:
+
+```yaml
+kv_offload_fraction: 0
+kv_cache_model:
+  capacity_bytes: 768
+  block_tokens: 2
+```
+
+These tiny values suit the smoke model, not a real accelerator specification.
+The model works in sync, both local async modes and separated shared-filesystem MPI.
+Each rollout owner has its own logical capacity; trainer-only MPI rank 0 has no KV pool.
+Use `kv_offload_fraction: 0` to make the offload choice explicit and keep the original fraction model when this mapping is absent.
+Legacy checkpoint fingerprints omit an absent mapping.
+
+Resident pages contain metadata only; no GPU/CPU tensor arrays are allocated.
+Page charge is `block_tokens * bytes_per_token`; storage payload is the exact valid token extent, including a partial tail.
+Blocks must fit `max_payload_bytes`, and every full request history must fit one owner's page budget.
+A too-long request is rejected before files are created rather than pretending partial history is sufficient for full attention.
+
+The working set for the current chunk/observation ingestion is pinned until its safe point completes.
+Admission waits when other pinned sections occupy the needed capacity; unpinned LRU blocks are evicted first.
+Dirty eviction performs a real backend write, offloaded demand performs a real read, and a clean persisted copy avoids repeated writes.
+Resident hits need no file I/O.
+Tool waits unpin history so pressure from other requests may offload it; reload must finish before generation resumes.
+Already admitted compute may overlap cache-transfer I/O, while metadata/placement transactions serialize per owner.
+
+Only full-block prefixes share identity within a policy/owner; the partial prefix tail and generated history remain request-private.
+Completed/cancelled trajectories release private KV; reusable prefix pages remain until policy retirement.
+Async file retirement uses the existing delayed GC and sync deletes after logical release.
+New policy invalidates logical residency and retained requests re-prefill under the new version without reading old keys.
+Logical `resident_bytes`/page peak, offload/reload payload/ops, capacity wait and pin count are reported per rank/owner.
+Physical KV payload/file occupancy remains a separate metric and may include retired or clean persisted copies.
+The normalized observation records these cache settings and `uncalibrated` status.
+
+This is a storage-enabled chunk-safe working-set swapping assumption, not stock veRL/vLLM GPU-cache behavior.
+It does not emulate CUDA/CPU staging, continuous batching, radix-tree sharing, full-lifetime pinning or finite storage-tier capacity.
+Actual disk KV in a real reference must be traced separately from logical GPU-cache events before calibration.
 
 ## Separated MPI execution
 
