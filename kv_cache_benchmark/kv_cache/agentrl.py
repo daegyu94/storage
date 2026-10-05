@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 
+from kv_cache.agentrl_trace import validate_profile
 from kv_cache.backends import NVMeBackend
 from kv_cache.models import ModelConfig
 
@@ -25,6 +26,7 @@ from kv_cache.models import ModelConfig
 @dataclass(frozen=True)
 class AgentRLConfig:
     trainer_mode: str = "sync"
+    request_profile: dict | None = None
     iterations: int = 2
     requests_per_rank: int = 4
     concurrency: int = 2
@@ -79,6 +81,12 @@ class AgentRLConfig:
     def validate(self):
         if self.trainer_mode != "sync":
             raise ValueError("v0.1 supports trainer_mode=sync only")
+        if self.request_profile is not None:
+            validate_profile(self.request_profile)
+            if self.request_profile["mode"] != "sync":
+                raise ValueError("only sync profiles are replayable; async profiles are analysis-only")
+            if self.request_profile["provenance"].get("observation_boundary") != "host_file_api":
+                raise ValueError("profile requires host_file_api observation boundary")
         if self.network_mode not in ("none", "estimate"):
             raise ValueError("network_mode must be none or estimate")
         if type(self.persist_trajectories) is not bool:
@@ -186,6 +194,22 @@ class AgentRLConfig:
             ),
             (self.prompt_tokens + max(self.response_tokens) + (self.turns - 1) * self.observation_tokens) * 12,
         )
+        if self.request_profile:
+            for record in self.request_profile["records"]:
+                largest = max(
+                    largest,
+                    record["prompt_tokens"] * 4,
+                    record["trajectory_bytes"],
+                    int(
+                        max(
+                            record["prefix_tokens"],
+                            self.chunk_tokens,
+                            max(t["observation_tokens"] for t in record["turns"]),
+                        )
+                        * self.bytes_per_token
+                        * self.kv_offload_fraction
+                    ),
+                )
         if largest > self.max_payload_bytes:
             raise ValueError("payload exceeds max_payload_bytes; use smaller chunks or an explicit memory budget")
 
@@ -195,7 +219,10 @@ class AgentRLConfig:
 
     @property
     def fingerprint(self):
-        return hashlib.sha256(json.dumps(asdict(self), sort_keys=True).encode()).hexdigest()
+        values = asdict(self)
+        if self.request_profile is None:
+            values.pop("request_profile")  # Keep v0.1 checkpoint fingerprints compatible.
+        return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
 def kv_delta_bytes(previous_tokens, new_tokens, bytes_per_token, fraction):
@@ -253,6 +280,7 @@ class SyncLifecycle:
         self.io_sequence = self.io_active = self.io_active_peak = 0
         self.kv_sizes = {}
         self.kv_peak_bytes = 0
+        self.completed_requests = []
 
     def gather_all(self, value):
         return self.comm.allgather(value) if self.comm else [value]
@@ -287,8 +315,12 @@ class SyncLifecycle:
         self.kv = self._backend(rank_dir / "kv")
         self.prompts = self._backend(rank_dir / "prompts")
         self.trajectories = self._backend(rank_dir / "trajectories")
-        for request in range(self.config.requests_per_rank):
-            self.prompts.write(f"prompt-{request}", self.payload(f"prompt-{request}", self.config.prompt_tokens * 4))
+        steps = range(self.config.iterations) if self.config.request_profile else (0,)
+        for iteration in steps:
+            for request in range(self.config.requests_per_rank):
+                key = self.prompt_key(request, iteration)
+                shape = self.request_shape(request, iteration)
+                self.prompts.write(key, self.payload(key, shape["prompt_tokens"] * 4))
         if self.rank == 0:
             self.write_json(self.result_dir / "config.json", asdict(self.config))
 
@@ -360,37 +392,83 @@ class SyncLifecycle:
             self.io_active -= 1
         return data
 
-    async def rollout(self, request, semaphore):
+    def prompt_key(self, request, iteration):
+        return f"prompt-i{iteration}-r{request}" if self.config.request_profile else f"prompt-{request}"
+
+    def request_shape(self, request, iteration):
         config = self.config
-        queued = time.monotonic()
-        async with semaphore:
-            self.active += 1
-            self.active_peak = max(self.active_peak, self.active)
-            request_start = time.monotonic()
-            self.trace.emit(
-                "rollout_start",
-                request=request,
-                policy=self.version,
-                active=self.active,
-                queue_wait_s=request_start - queued,
-            )
-            rng = random.Random(config.seed + self.rank * 1_000_003 + self.trace.iteration * 1009 + request)
-            response = config.response_tokens[request % len(config.response_tokens)]
-            factor = config.rank_rate_factors[self.rank % len(config.rank_rate_factors)]
-            rate = config.tokens_per_second * factor
-            await self.io(self.prompts, "read", f"prompt-{request}", kind="prompt", request=request)
-            hot = rng.random() < config.prefix_reuse_probability
-            prefix = (
+        if config.request_profile:
+            records = [r for r in config.request_profile["records"] if r["rank"] == self.rank]
+            if not records:
+                raise ValueError(f"profile has no records for rank {self.rank}")
+            return records[(iteration * config.requests_per_rank + request) % len(records)]
+        rng = random.Random(config.seed + self.rank * 1_000_003 + iteration * 1009 + request)
+        response = config.response_tokens[request % len(config.response_tokens)]
+        factor = config.rank_rate_factors[self.rank % len(config.rank_rate_factors)]
+        hot = rng.random() < config.prefix_reuse_probability
+        prefix = (
+            str(
                 rng.choices(
                     range(config.hot_prefixes),
                     weights=[(i + 1) ** -config.prefix_skew for i in range(config.hot_prefixes)],
                 )[0]
-                if hot
-                else f"cold-{self.trace.iteration}-{request}"
             )
-            prefix_key = f"v{self.version}-prefix-{prefix}"
+            if hot
+            else f"cold-{iteration}-{request}"
+        )
+        turns = []
+        for turn in range(config.turns):
+            tokens = response // config.turns + (turn < response % config.turns)
+            last = turn + 1 == config.turns
+            turns.append(
+                {
+                    "generated_tokens": tokens,
+                    "decode_active_s": tokens / (config.tokens_per_second * factor),
+                    "tool_delay_s": 0 if last else config.tool_delay_s,
+                    "observation_tokens": 0 if last else config.observation_tokens,
+                }
+            )
+        return {
+            "rank": self.rank,
+            "prompt_tokens": config.prompt_tokens,
+            "prefix_tokens": config.prompt_tokens,
+            "prefix_id": prefix,
+            "turns": turns,
+            "trajectory_bytes": (config.prompt_tokens + response + (config.turns - 1) * config.observation_tokens) * 12,
+        }
+
+    async def rollout(self, request, semaphore):
+        queued = time.monotonic()
+        async with semaphore:
+            self.active += 1
+            self.active_peak = max(self.active_peak, self.active)
+            try:
+                await self.rollout_body(request, queued)
+            finally:
+                self.active -= 1
+
+    async def rollout_body(self, request, queued):
+        config = self.config
+        request_start = time.monotonic()
+        shape = self.request_shape(request, self.trace.iteration)
+        factor = config.rank_rate_factors[self.rank % len(config.rank_rate_factors)]
+        self.trace.emit(
+            "rollout_start",
+            request=request,
+            policy=self.version,
+            active=self.active,
+            prompt_tokens=shape["prompt_tokens"],
+            prefix_tokens=shape["prefix_tokens"],
+            queue_wait_s=request_start - queued,
+        )
+        await self.io(
+            self.prompts, "read", self.prompt_key(request, self.trace.iteration), kind="prompt", request=request
+        )
+        prefix_tokens = shape["prefix_tokens"]
+        if prefix_tokens:
+            prefix_key = f"v{self.version}-prefix-{shape['prefix_id']}"
             lock = self.prefix_locks.setdefault(prefix_key, asyncio.Lock())
-            prefix_bytes = kv_delta_bytes(0, config.prompt_tokens, config.bytes_per_token, config.kv_offload_fraction)
+            prefix_bytes = kv_delta_bytes(0, prefix_tokens, config.bytes_per_token, config.kv_offload_fraction)
             async with lock:
                 if prefix_key in self.prefixes:
                     self.trace.emit("prefix_hit", request=request, key=prefix_key, policy=self.version)
@@ -398,65 +476,100 @@ class SyncLifecycle:
                         await self.io(self.kv, "read", prefix_key, kind="kv", request=request)
                 else:
                     self.trace.emit("prefix_miss", request=request, key=prefix_key, policy=self.version)
-                    await asyncio.sleep(config.prompt_tokens / (config.prefill_tokens_per_second * factor))
+                    await asyncio.sleep(prefix_tokens / (config.prefill_tokens_per_second * factor))
                     if prefix_bytes:
                         await self.io(self.kv, "write", prefix_key, prefix_bytes, kind="kv", request=request)
                     self.prefixes.add(prefix_key)
-            history = config.prompt_tokens
-            generated = 0
-            chunk_id = 0
-            for turn in range(config.turns):
-                turn_tokens = response // config.turns + (turn < response % config.turns)
-                remaining = turn_tokens
-                while remaining:
-                    tokens = min(config.chunk_tokens, remaining)
-                    self.trace.emit("generation_begin", request=request, tokens=tokens, policy=self.version, turn=turn)
-                    await asyncio.sleep(tokens / rate)
-                    self.trace.emit("generation_end", request=request, tokens=tokens, policy=self.version, turn=turn)
-                    size = kv_delta_bytes(history, tokens, config.bytes_per_token, config.kv_offload_fraction)
-                    if size:
-                        await self.io(
-                            self.kv,
-                            "write",
-                            f"v{self.version}-r{request}-chunk-{chunk_id}",
-                            size,
-                            kind="kv",
-                            request=request,
-                        )
-                    history += tokens
-                    generated += tokens
-                    chunk_id += 1
-                    remaining -= tokens
-                if turn + 1 < config.turns:
-                    self.trace.emit("tool_begin", request=request, turn=turn)
-                    await asyncio.sleep(config.tool_delay_s)
-                    self.trace.emit("tool_end", request=request, turn=turn)
-                    size = kv_delta_bytes(
-                        history, config.observation_tokens, config.bytes_per_token, config.kv_offload_fraction
-                    )
-                    if size:
-                        await self.io(
-                            self.kv, "write", f"v{self.version}-r{request}-obs-{turn}", size, kind="kv", request=request
-                        )
-                    history += config.observation_tokens
-            if config.persist_trajectories:
-                await self.io(
-                    self.trajectories,
-                    "write",
-                    f"v{self.version}-r{request}",
-                    history * 12,
-                    kind="trajectory",
+        suffix = shape["prompt_tokens"] - prefix_tokens
+        if suffix:
+            await asyncio.sleep(suffix / (config.prefill_tokens_per_second * factor))
+            size = kv_delta_bytes(prefix_tokens, suffix, config.bytes_per_token, config.kv_offload_fraction)
+            if size:
+                await self.io(self.kv, "write", f"v{self.version}-r{request}-suffix", size, kind="kv", request=request)
+        history = shape["prompt_tokens"]
+        generated = chunk_id = 0
+        observed_turns = []
+        for turn, planned in enumerate(shape["turns"]):
+            remaining = planned["generated_tokens"]
+            active_s = 0.0
+            while remaining:
+                tokens = min(config.chunk_tokens, remaining)
+                delay = planned["decode_active_s"] * tokens / planned["generated_tokens"]
+                self.trace.emit(
+                    "generation_begin",
                     request=request,
+                    tokens=tokens,
+                    policy=self.version,
+                    turn=turn,
+                    modeled_compute_s=delay,
                 )
-            self.active -= 1
-            self.trace.emit(
-                "rollout_complete",
+                started = time.monotonic()
+                await asyncio.sleep(delay)
+                active_s += time.monotonic() - started
+                self.trace.emit("generation_end", request=request, tokens=tokens, policy=self.version, turn=turn)
+                size = kv_delta_bytes(history, tokens, config.bytes_per_token, config.kv_offload_fraction)
+                if size:
+                    await self.io(
+                        self.kv,
+                        "write",
+                        f"v{self.version}-r{request}-chunk-{chunk_id}",
+                        size,
+                        kind="kv",
+                        request=request,
+                    )
+                history += tokens
+                generated += tokens
+                chunk_id += 1
+                remaining -= tokens
+            tool_s = 0.0
+            if turn + 1 < len(shape["turns"]):
+                self.trace.emit("tool_begin", request=request, turn=turn)
+                started = time.monotonic()
+                await asyncio.sleep(planned["tool_delay_s"])
+                tool_s = time.monotonic() - started
+                self.trace.emit("tool_end", request=request, turn=turn)
+                size = kv_delta_bytes(
+                    history, planned["observation_tokens"], config.bytes_per_token, config.kv_offload_fraction
+                )
+                if size:
+                    await self.io(
+                        self.kv, "write", f"v{self.version}-r{request}-obs-{turn}", size, kind="kv", request=request
+                    )
+                history += planned["observation_tokens"]
+            observed_turns.append({**planned, "decode_active_s": active_s, "tool_delay_s": tool_s})
+        if config.persist_trajectories:
+            await self.io(
+                self.trajectories,
+                "write",
+                f"v{self.version}-r{request}",
+                shape["trajectory_bytes"],
+                kind="trajectory",
                 request=request,
-                policy=self.version,
-                generated_tokens=generated,
-                duration_s=time.monotonic() - request_start,
-                active=self.active,
             )
+        ended = time.monotonic()
+        self.completed_requests.append(
+            {
+                **shape,
+                "turns": observed_turns,
+                "trajectory_bytes": shape["trajectory_bytes"] if config.persist_trajectories else 0,
+                "iteration": self.trace.iteration,
+                "request": request,
+                "start_s": request_start - self.trace.start,
+                "end_s": ended - self.trace.start,
+                "policy_start": self.version,
+                "policy_end": self.version,
+                "prompt_policy": self.version,
+                "trainer_policy_at_accept": self.version,
+            }
+        )
+        self.trace.emit(
+            "rollout_complete",
+            request=request,
+            policy=self.version,
+            generated_tokens=generated,
+            duration_s=ended - request_start,
+            active=self.active - 1,
+        )
 
     async def rollouts(self):
         self.trace.emit("rollout_phase_begin", policy=self.version)
@@ -715,6 +828,37 @@ class SyncLifecycle:
             "io_latency_s": quantiles(flat_latencies) if flat_latencies else {},
         }
         self.phase("results", lambda: self.write_json(self.result_dir / f"rank-{self.rank}.json", self.trace.events))
+        if self.completed_requests:
+            provenance = {
+                "kind": "poc",
+                "run_id": self.result_dir.name,
+                "revision": "source-sha256:"
+                + hashlib.sha256(
+                    b"".join(
+                        (Path(__file__).parent / name).read_bytes()
+                        for name in ("agentrl.py", "agentrl_trace.py", "backends.py", "models.py")
+                    )
+                ).hexdigest(),
+                "observation_boundary": "host_file_api",
+                "clock": "rank_local",
+            }
+            if self.config.request_profile:
+                provenance["calibration_sha256"] = self.config.request_profile["provenance"]["source_sha256"]
+            normalized = {
+                "schema_version": 1,
+                "mode": "sync",
+                "provenance": provenance,
+                "requests": self.completed_requests,
+                "events": self.trace.events,
+            }
+        else:
+            normalized = None
+        self.phase(
+            "normalized trace",
+            lambda: (
+                self.write_json(self.result_dir / f"trace-rank-{self.rank}.json", normalized) if normalized else None
+            ),
+        )
         self.phase(
             "summary", lambda: self.write_json(self.result_dir / "summary.json", summary) if self.rank == 0 else None
         )

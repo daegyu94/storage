@@ -16,6 +16,7 @@ def main():
     parser.add_argument("--storage-root", required=True, type=Path)
     parser.add_argument("--results-dir", required=True, type=Path)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--profile", type=Path, help="Joint normalized request profile; sync replay only")
     parser.add_argument("--mpi", action="store_true", help="Use mpi4py collectives under an MPI launcher")
     args = parser.parse_args()
     comm = None
@@ -40,6 +41,10 @@ def main():
             import yaml
 
             values = yaml.safe_load(raw)
+        if args.profile:
+            if not isinstance(values, dict) or "request_profile" in values:
+                raise ValueError("--profile requires a mapping without an embedded request_profile")
+            values["request_profile"] = json.loads(args.profile.read_text())
         config = AgentRLConfig.from_dict(values)
         runner = SyncLifecycle(config, args.storage_root, args.results_dir, comm=comm, resume=args.resume)
         summary = runner.run()
