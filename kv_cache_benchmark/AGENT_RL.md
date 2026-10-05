@@ -383,3 +383,55 @@ Comparison adds completed-owner distribution (total variation distance), complet
 `cross_rank_groups` counts complete groups whose sibling clocks differ; their raw timestamps are never subtracted to create straggler latency.
 Group coverage and partial/censoring evidence must be inspected alongside marginal byte/rate agreement.
 `real_validation` remains false and all current runs remain `uncalibrated`.
+
+## veRL/vLLM reference geometry
+
+The optional `rollout_reference` describes veRL + Ray with its pinned vLLM 0.29.0 dense cache geometry.
+It does not start Ray, vLLM or a GPU; other Agent RL frameworks remain TBD.
+Existing configs keep their byte calculations and checkpoint fingerprints.
+
+```yaml
+rollout_reference:
+  gpu_name: target GPU label (unmeasured)
+  framework: verl
+  orchestrator: ray
+  engine: vllm
+  engine_version: 0.29.0
+  tensor_parallel_size: 4
+  storage_payload_scope: replica_aggregate_unpadded
+  kv_budget_bytes_per_gpu: 2949120
+kv_cache_model:
+  block_tokens: 16
+# Dense Qwen3-8B cache geometry; dtype is KV storage dtype.
+model:
+  name: Qwen/Qwen3-8B
+  num_layers: 36
+  hidden_dim: 4096
+  num_heads: 32
+  kv_heads: 8
+  _kv_dim_override: 128
+  attention_type: gqa
+  dtype: bfloat16
+kv_offload_fraction: 0
+```
+
+This deliberately constrained budget is a correctness scenario, not a GPU memory/performance measurement.
+Keep the remaining lifecycle settings in your config and ensure each full request fits the resolved cache budget.
+An optional `gpu_memory_bytes` declares a ceiling; no GPU catalog or throughput inference is performed.
+If a KV budget is given, capacity mode is required and missing `capacity_bytes` is resolved from whole worker blocks.
+Explicit capacity conflicting with the GPU budget fails before I/O.
+Without a KV budget, geometry can also be used with the existing fractional offload model.
+
+Uniform dense MHA/GQA with equal K/V head dimensions and float32/float16/bfloat16 is supported.
+PP/DCP, MLA, hybrid/sliding-window attention and packed/quantized KV layouts require a different observed cache specification.
+Query heads must divide across TP; KV heads are sharded when TP is smaller and replicated when TP exceeds their count.
+Thus TP 16 for 8 KV heads stores two copies of the unique KV payload across the replica.
+`bytes_per_token` uses the aggregate TP worker payload, preserving actual chunk/cache I/O accounting.
+Each synthetic owner remains a complete rollout replica; MPI ranks are not TP GPU workers.
+
+All TP worker payloads are combined into one owner file; per-TP files, padded layouts and TP I/O concurrency are not emulated.
+The GPU label does not change generation or prefill service budgets.
+Summary and normalized trace report worker/unique/aggregate geometry, GPU budget and the explicit `uncalibrated` service-time and connector-behavior states.
+Native vLLM CPU-only offload does not imply filesystem KV I/O.
+Its filesystem secondary tier, completed-block/prompt eligibility and CPU staging differ from this extension's fractional or chunk-safe dirty-eviction model.
+Specifying reference geometry does not certify native connector fidelity.

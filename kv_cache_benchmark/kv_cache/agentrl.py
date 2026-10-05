@@ -13,7 +13,7 @@ import random
 import socket
 import time
 import uuid
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,6 +31,7 @@ class AgentRLConfig:
     request_profile: dict | None = None
     async_workload: dict | None = None
     kv_cache_model: dict | None = None
+    rollout_reference: dict | None = None
     generation_rate_scope: str = "request"
     iterations: int = 2
     requests_per_rank: int = 4
@@ -80,6 +81,24 @@ class AgentRLConfig:
         if unknown:
             raise ValueError(f"unknown configuration fields: {sorted(unknown)}")
         config = cls(**values)
+        if config.rollout_reference is not None:
+            from kv_cache.agentrl_reference import ReferenceSettings
+
+            reference = ReferenceSettings.parse(config.rollout_reference)
+            if reference.kv_budget_bytes_per_gpu is not None:
+                if not isinstance(config.kv_cache_model, dict):
+                    raise ValueError("reference GPU KV budget requires kv_cache_model capacity mode")
+                try:
+                    model = ModelConfig(**config.model)
+                except TypeError as exc:
+                    raise ValueError(f"invalid reference model: {exc}") from exc
+                cache = dict(config.kv_cache_model)
+                capacity = reference.budget(reference.geometry(model), cache.get("block_tokens", 16))[
+                    "replica_capacity_bytes"
+                ]
+                if "capacity_bytes" in cache and cache["capacity_bytes"] != capacity:
+                    raise ValueError("cache capacity conflicts with reference GPU KV budget")
+                config = replace(config, kv_cache_model={**cache, "capacity_bytes": capacity})
         config.validate()
         return config
 
@@ -199,7 +218,7 @@ class AgentRLConfig:
         for name in ("num_layers", "hidden_dim", "num_heads", "kv_heads"):
             if type(getattr(model, name)) is not int or getattr(model, name) <= 0:
                 raise ValueError(f"invalid model {name}")
-        if model.hidden_dim % model.num_heads or model.num_heads % model.kv_heads:
+        if (not model._kv_dim_override and model.hidden_dim % model.num_heads) or model.num_heads % model.kv_heads:
             raise ValueError("model heads must divide hidden_dim and num_heads")
         if model.dtype not in ("float32", "float16", "bfloat16", "int8"):
             raise ValueError("unsupported KV dtype")
@@ -210,6 +229,17 @@ class AgentRLConfig:
                 raise ValueError(f"invalid model {name}")
         if model.attention_type == "mla" and model.kv_lora_rank == 0:
             raise ValueError("MLA requires a positive kv_lora_rank")
+        if self.rollout_reference is not None:
+            from kv_cache.agentrl_reference import ReferenceSettings
+
+            reference = ReferenceSettings.parse(self.rollout_reference)
+            geometry = reference.geometry(model)
+            if reference.kv_budget_bytes_per_gpu is not None:
+                if not isinstance(self.kv_cache_model, dict):
+                    raise ValueError("reference GPU KV budget requires kv_cache_model capacity mode")
+                budget = reference.budget(geometry, self.kv_cache_model.get("block_tokens", 16))
+                if self.kv_cache_model.get("capacity_bytes") != budget["replica_capacity_bytes"]:
+                    raise ValueError("cache capacity conflicts with reference GPU KV budget")
         largest = max(
             self.checkpoint_bytes_per_rank,
             self.prompt_tokens * 4,
@@ -245,7 +275,20 @@ class AgentRLConfig:
 
     @property
     def bytes_per_token(self):
-        return ModelConfig(**self.model).kv_cache_size_per_token
+        model = ModelConfig(**self.model)
+        if self.rollout_reference is not None:
+            from kv_cache.agentrl_reference import ReferenceSettings
+
+            return ReferenceSettings.parse(self.rollout_reference).geometry(model)["replica_storage_bytes_per_token"]
+        return model.kv_cache_size_per_token
+
+    @property
+    def reference_summary(self):
+        if self.rollout_reference is None:
+            return None
+        from kv_cache.agentrl_reference import ReferenceSettings
+
+        return ReferenceSettings.parse(self.rollout_reference).summary(ModelConfig(**self.model), self.kv_cache_model)
 
     @property
     def fingerprint(self):
@@ -258,6 +301,8 @@ class AgentRLConfig:
             values.pop("async_workload")
         if self.kv_cache_model is None:
             values.pop("kv_cache_model")
+        if self.rollout_reference is None:
+            values.pop("rollout_reference")
         return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
@@ -1040,15 +1085,19 @@ class SyncLifecycle:
     def summary_fields(self):
         return {}
 
+    def reference_fields(self):
+        return {"rollout_reference": self.config.reference_summary} if self.config.rollout_reference else {}
+
     def normalized_trace_fields(self):
         if self.config.kv_cache_model is None:
-            return {}
+            return self.reference_fields()
         return {
+            **self.reference_fields(),
             "kv_cache_model": {
                 "settings": self.config.kv_cache_model,
                 "residency_model": "chunk_safe_working_set",
                 "fidelity": "uncalibrated",
-            }
+            },
         }
 
     def export_trace(self):
@@ -1090,6 +1139,7 @@ class SyncLifecycle:
             "latency_by_kind_op_s": {k: quantiles(v) for k, v in by_kind.items()},
             "io_latency_s": quantiles(flat_latencies) if flat_latencies else {},
             **self.summary_fields(),
+            **self.reference_fields(),
         }
         self.phase("results", lambda: self.write_json(self.result_dir / f"rank-{self.rank}.json", self.trace.events))
         if self.export_trace():
@@ -1105,6 +1155,7 @@ class SyncLifecycle:
                             "agentrl_async.py",
                             "agentrl_mpi.py",
                             "agentrl_kv.py",
+                            "agentrl_reference.py",
                             "agentrl_trace.py",
                             "backends.py",
                             "models.py",
