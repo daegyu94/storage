@@ -56,7 +56,7 @@ def invoke(tmp_path, config=None, ranks=1, extra=(), env=None):
     return process
 
 
-@pytest.mark.parametrize("ranks", [1, 2])
+@pytest.mark.parametrize("ranks", [1, 2, 4])
 def test_cli_run_and_resume(tmp_path, ranks):
     process = invoke(tmp_path, ranks=ranks)
     assert process.returncode == 0, process.stderr

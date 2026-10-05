@@ -285,7 +285,7 @@ def test_network_slowdown_delays_policy_install(tmp_path):
     slow, _ = run(tmp_path / "slow", replace(config, nic_gbps=0.0001))
 
     def install(r):
-        return next(e["t_s"] for e in r.trace.events if e["event"] == "policy_install")
+        return next(e["t_s"] for e in r.trace.events if e["event"] == "policy_install" and e["iteration"] == 0)
 
     assert install(slow) > install(fast) + 0.12
 
@@ -293,3 +293,117 @@ def test_network_slowdown_delays_policy_install(tmp_path):
 def test_extreme_finite_rates_rejected_before_division():
     with pytest.raises(ValueError, match="effective"):
         tiny(tokens_per_second=1e-300, rank_rate_factors=[1e-300])
+
+
+@pytest.mark.parametrize("values", [None, [], 1])
+def test_config_requires_mapping(values):
+    with pytest.raises(ValueError, match="mapping"):
+        AgentRLConfig.from_dict(values)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        None,
+        {"name": "missing"},
+        {**tiny().model, "num_layers": 0},
+        {**tiny().model, "attention_type": "unknown"},
+        {**tiny().model, "_kv_dim_override": -1},
+        {**tiny().model, "attention_type": "mla"},
+    ],
+)
+def test_model_rejects_invalid_geometry(model):
+    with pytest.raises(ValueError):
+        tiny(model=model)
+
+
+def test_network_extreme_rate_rejected_before_sleep():
+    with pytest.raises(ValueError, match="network"):
+        tiny(network_mode="estimate", nic_gbps=1e-300, nic_efficiency=1e-300)
+
+
+@pytest.mark.parametrize(
+    "update,match",
+    [
+        ({"schema_version": 99}, "schema"),
+        ({"next_iteration": 999}, "iteration"),
+        ({"shards": []}, "count"),
+        ({"shards": [{"rank": 9, "path": "../../other.npy"}]}, "ownership"),
+        ({"shards": [{"rank": 0, "path": "rank-0/state.npy", "bytes": 99}]}, "byte"),
+    ],
+)
+def test_checkpoint_manifest_contracts(tmp_path, update, match):
+    runner, _ = run(tmp_path, tiny(iterations=1))
+    manifest = runner.storage_dir / "checkpoints" / "step-1" / "manifest.json"
+    data = json.loads(manifest.read_text())
+    data.update(update)
+    manifest.write_text(json.dumps(data))
+    with pytest.raises(RuntimeError, match=match):
+        run(tmp_path / "reject", tiny(iterations=1), resume=manifest)
+
+
+def test_checkpoint_disabled_and_cold_prefix_profiles(tmp_path):
+    runner, summary = run(tmp_path, tiny(iterations=1, checkpoint_every=0, prefix_reuse_probability=0))
+    assert not list(runner.storage_dir.glob("checkpoints/*/manifest.json"))
+    assert summary["final_policy_version"] == 1
+    assert sum(e["event"] == "prefix_miss" for e in runner.trace.events) == 3
+
+
+def test_interrupted_manifest_publish_leaves_no_committed_checkpoint(tmp_path, monkeypatch):
+    original = SyncLifecycle.write_json
+
+    def fail_commit(path, data):
+        if path.name == "manifest.json":
+            raise OSError("interrupted publish")
+        return original(path, data)
+
+    monkeypatch.setattr(SyncLifecycle, "write_json", staticmethod(fail_commit))
+    with pytest.raises(RuntimeError, match="checkpoint commit"):
+        run(tmp_path, tiny(iterations=1))
+    assert list((tmp_path / "data").glob("*/checkpoints/step-1/rank-0/state.npy"))
+    assert not list((tmp_path / "data").glob("*/checkpoints/*/manifest.json"))
+    assert not list((tmp_path / "results").glob("*/summary.json"))
+
+
+def test_logical_workload_is_deterministic_and_roots_are_preserved(tmp_path):
+    root = tmp_path / "a" / "data"
+    root.mkdir(parents=True)
+    original = root / "unrelated.npy"
+    original.write_bytes(b"preserve")
+    first, _ = run(tmp_path / "a", tiny(concurrency=1))
+    second, _ = run(tmp_path / "b", tiny(concurrency=1))
+
+    def logical(r):
+        return [
+            (e["iteration"], e.get("request"), e.get("key"), e.get("bytes"), e.get("tokens"))
+            for e in r.trace.events
+            if e["event"] in ("io_end", "generation_end")
+        ]
+
+    assert sorted(logical(first), key=str) == sorted(logical(second), key=str)
+    assert original.read_bytes() == b"preserve"
+
+
+def test_recovery_installs_weights_before_first_rollout(tmp_path):
+    config = tiny(weight_sync_delay_s=0.03)
+    runner, _ = run(tmp_path, config)
+    manifest = runner.storage_dir / "checkpoints" / "step-1" / "manifest.json"
+    resumed, _ = run(tmp_path / "restart", config, resume=manifest)
+    events = resumed.trace.events
+    recovery = next(e["t_s"] for e in events if e["event"] == "recovery_end")
+    first_rollout = next(e["t_s"] for e in events if e["event"] == "rollout_start")
+    install = next(e for e in events if e["event"] == "policy_install")
+    assert install["policy"] == 1
+    assert recovery < install["t_s"] < first_rollout
+    assert first_rollout - recovery >= 0.029
+
+
+def test_checkpoint_header_shape_is_checked_before_loading(tmp_path):
+    runner, _ = run(tmp_path, tiny(iterations=1))
+    manifest = runner.storage_dir / "checkpoints" / "step-1" / "manifest.json"
+    shard = manifest.parent / "rank-0/state.npy"
+    data = np.load(shard, allow_pickle=False)
+    # Preserve payload checksum/size while changing the serialization geometry.
+    np.save(shard, data.reshape(64, 2), allow_pickle=False)
+    with pytest.raises(RuntimeError, match="header"):
+        run(tmp_path / "bad-header", tiny(iterations=1), resume=manifest)

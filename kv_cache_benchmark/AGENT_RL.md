@@ -83,9 +83,10 @@ python kv_cache_benchmark/agent-rl.py --config agentrl.yaml \
 ```
 
 Recovery reopens files with `NVMeBackend(preserve_existing=True)` without deleting checkpoint payloads.
-It verifies every local shard before resuming at a synchronous iteration boundary; KV is reconstructed in the new run namespace.
+It verifies every local shard before resuming at a synchronous iteration boundary; The restored policy is installed with the configured weight-sync delay before new rollout; KV is reconstructed in the new run namespace.
 Missing/incomplete/corrupt checkpoints and configuration/world-size mismatches fail.
 Node-local storage requires the same rank-to-node placement and paths on resume.
+External storage KV is removed after weight installation; this differs from the earlier GPU-cache release at the real sync trainer's sample boundary.
 This is a synthetic byte checkpoint, not DLIO or FSDP/Megatron state serialization, and does not recover in-flight async trajectories.
 
 ## Results and interpretation

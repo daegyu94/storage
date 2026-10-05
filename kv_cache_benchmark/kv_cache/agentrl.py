@@ -144,6 +144,18 @@ class AgentRLConfig:
                 effective = rate * factor
                 if effective == 0 or not math.isfinite(effective):
                     raise ValueError("effective generation/prefill rate must be finite and positive")
+        if self.network_mode == "estimate":
+            try:
+                bandwidth = self.nic_gbps * 1e9 / 8 * self.nic_efficiency / self.nic_sharers
+                valid = (
+                    bandwidth > 0
+                    and math.isfinite(bandwidth)
+                    and math.isfinite(max(self.max_payload_bytes, self.weight_bytes) / bandwidth)
+                )
+            except (OverflowError, ZeroDivisionError):
+                valid = False
+            if not valid:
+                raise ValueError("effective network bandwidth/delay must be finite and positive")
         if not isinstance(self.model, dict):
             raise ValueError("model must be a mapping")
         try:
@@ -492,6 +504,24 @@ class SyncLifecycle:
             expected_path = f"rank-{self.rank}/state.npy"
             if shard.get("rank") != self.rank or shard.get("path") != expected_path:
                 raise ValueError("checkpoint shard ownership/path mismatch")
+            path = self.resume.parent / expected_path
+            # Validate allocation geometry before np.load materializes the array.
+            with path.open("rb") as stream:
+                header_version = np.lib.format.read_magic(stream)
+                if header_version == (1, 0):
+                    shape, fortran, dtype = np.lib.format.read_array_header_1_0(stream)
+                elif header_version == (2, 0):
+                    shape, fortran, dtype = np.lib.format.read_array_header_2_0(stream)
+                else:
+                    raise ValueError("unsupported checkpoint header version")
+                expected_bytes = self.config.checkpoint_bytes_per_rank
+                if (
+                    shape != (expected_bytes,)
+                    or dtype != np.dtype("uint8")
+                    or fortran
+                    or path.stat().st_size != stream.tell() + expected_bytes
+                ):
+                    raise ValueError("checkpoint header/physical size mismatch")
             backend = self._backend(self.resume.parent / f"rank-{self.rank}")
             payload = asyncio.run(self.io(backend, "read", "state", kind="checkpoint"))
             if payload.nbytes != self.config.checkpoint_bytes_per_rank or payload.nbytes != shard.get("bytes"):
@@ -521,6 +551,7 @@ class SyncLifecycle:
         return {
             "rank": self.rank,
             "host": socket.gethostname(),
+            "local_rank": os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", os.environ.get("MPI_LOCALRANKID", "0")),
             "active_peak": self.active_peak,
             "io": totals,
             "elapsed_s": time.monotonic() - self.trace.start,
@@ -528,10 +559,27 @@ class SyncLifecycle:
             "barrier_wait_s": sum(e.get("duration_s", 0) for e in self.trace.events if e["event"] == "rollout_barrier"),
         }
 
+    def install_weights(self, version, *, initial=False):
+        self.trace.emit("weight_sync_begin", policy=version, initial=initial)
+        modeled_s = network_delay(self.config, self.config.weight_bytes)
+        delay = self.config.weight_sync_delay_s + modeled_s
+        self.phase("weight sync", lambda: time.sleep(delay))
+        self.version = version
+        self.trace.emit(
+            "weight_sync_end",
+            policy=version,
+            initial=initial,
+            modeled_delay_s=delay,
+            base_delay_s=self.config.weight_sync_delay_s,
+            modeled_network_s=modeled_s,
+        )
+        self.trace.emit("policy_install", policy=version, initial=initial)
+
     def run(self):
         self.phase("setup", self.setup)
         if self.resume:
             self.recover()
+        self.install_weights(self.version, initial=True)
         for iteration in range(self.start_iteration, self.config.iterations):
             self.trace.iteration = iteration
             started = time.monotonic()
@@ -559,18 +607,7 @@ class SyncLifecycle:
             self.trace.emit("train_end", policy=self.version + 1)
             if self.config.checkpoint_every and (iteration + 1) % self.config.checkpoint_every == 0:
                 self.checkpoint(iteration + 1)
-            self.trace.emit("weight_sync_begin", policy=self.version + 1)
-            delay = self.config.weight_sync_delay_s + network_delay(self.config, self.config.weight_bytes)
-            self.phase("weight sync", lambda delay=delay: time.sleep(delay))
-            self.trace.emit(
-                "weight_sync_end",
-                policy=self.version + 1,
-                modeled_delay_s=delay,
-                base_delay_s=self.config.weight_sync_delay_s,
-                modeled_network_s=network_delay(self.config, self.config.weight_bytes),
-            )
-            self.version = iteration + 1
-            self.trace.emit("policy_install", policy=self.version)
+            self.install_weights(iteration + 1)
             self.phase("KV invalidation", lambda: asyncio.run(self.invalidate()))
         ranks = self.gather_all(self.rank_summary())
         latencies = self.gather_all(
@@ -602,6 +639,7 @@ class SyncLifecycle:
             "config_sha256": self.config.fingerprint,
             "network_mode": self.config.network_mode,
             "ranks": ranks,
+            "wall_clock_s": max(rank["elapsed_s"] for rank in ranks),
             "io_totals": totals,
             "latency_by_kind_op_s": {k: quantiles(v) for k, v in by_kind.items()},
             "io_latency_s": quantiles(flat_latencies) if flat_latencies else {},

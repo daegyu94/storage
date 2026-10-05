@@ -239,6 +239,7 @@ class NVMeBackend(StorageBackend):
     """
 
     def __init__(self, base_path: str = None, *, preserve_existing: bool = False):
+        """Reset the directory by default; opt in to reopening persisted data."""
         self.temp_dir = None
         if base_path is None:
             self.temp_dir = tempfile.TemporaryDirectory(prefix="kv_cache_")
