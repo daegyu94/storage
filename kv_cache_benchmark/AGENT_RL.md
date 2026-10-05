@@ -96,6 +96,14 @@ Summary fields distinguish payload bytes, host-side actual I/O latency and model
 Percentiles aggregate operation samples, while summed operation duration is not wall-clock elapsed under concurrency.
 Rank-relative monotonic clocks are not aligned across hosts.
 
+Each operation has a rank-local `io_id` shared by `io_begin`, `io_actual_end` and `io_end`.
+Read arrivals carry the expected payload size; mismatches fail rather than silently changing the workload.
+`actual_s` includes executor scheduling and the backend call, while `backend_s` measures the existing backend's own timer.
+`io_actual_end` precedes the optional modeled NIC delay; `io_end` is the point at which the request may advance.
+`physical_file_bytes` is the observed `.npy` file length, not measured disk or network traffic.
+Checkpoint I/O carries the saved/loaded policy version even before that policy is installed for generation.
+Rank summaries include KV live/peak payload, prefix hit/miss counts, I/O concurrency, generated tokens and `iteration_elapsed_s`, which excludes setup, recovery and initial weight installation.
+
 The existing backend uses `.npy` serialization and fsync plus best-effort read fadvise, not guaranteed O_DIRECT or device-level latency tracing.
 The backend's constructor preserves its original destructive-reset default; this runner always selects preservation and a unique namespace.
 Payload byte counters exclude serialization headers and device/wire amplification.

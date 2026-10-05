@@ -250,6 +250,9 @@ class SyncLifecycle:
         self.start_iteration = 0
         self.prefixes = set()
         self.prefix_locks = {}
+        self.io_sequence = self.io_active = self.io_active_peak = 0
+        self.kv_sizes = {}
+        self.kv_peak_bytes = 0
 
     def gather_all(self, value):
         return self.comm.allgather(value) if self.comm else [value]
@@ -298,32 +301,63 @@ class SyncLifecycle:
         )
         return np.random.default_rng(seed).integers(0, 256, size=size, dtype=np.uint8)
 
-    async def io(self, backend, op, key, size=0, *, kind, request=None):
+    async def io(self, backend, op, key, size=0, *, kind, request=None, policy=None):
+        if op == "read" and not size:
+            size = backend.metadata[key]["size"]
         data = self.payload(key, size) if op == "write" else None
-        self.trace.emit("io_begin", op=op, key=key, bytes=size, kind=kind, request=request, policy=self.version)
+        identity = {
+            "io_id": self.io_sequence,
+            "op": op,
+            "key": key,
+            "kind": kind,
+            "request": request,
+            "policy": self.version if policy is None else policy,
+        }
+        self.io_sequence += 1
+        self.io_active += 1
+        self.io_active_peak = max(self.io_active_peak, self.io_active)
+        self.trace.emit("io_begin", **identity, bytes=size, io_active=self.io_active)
         started = time.monotonic()
-        if op == "write":
-            await asyncio.to_thread(backend.write, key, data)
-        elif op == "read":
-            data, _ = await asyncio.to_thread(backend.read, key)
-            size = data.nbytes
-        else:
-            await asyncio.to_thread(backend.delete, key)
-        actual_s = time.monotonic() - started
-        estimated_s = network_delay(self.config, size)
-        await asyncio.sleep(estimated_s)
-        self.trace.emit(
-            "io_end",
-            op=op,
-            key=key,
-            bytes=size,
-            kind=kind,
-            request=request,
-            policy=self.version,
-            actual_s=actual_s,
-            modeled_network_s=estimated_s,
-            duration_s=time.monotonic() - started,
-        )
+        try:
+            if op == "write":
+                timing = await asyncio.to_thread(backend.write, key, data)
+            elif op == "read":
+                data, timing = await asyncio.to_thread(backend.read, key)
+                if data.nbytes != size:
+                    raise ValueError("read payload size differs from arrival size")
+            elif op == "delete":
+                await asyncio.to_thread(backend.delete, key)
+                timing = None
+            else:
+                raise ValueError(f"unsupported I/O operation: {op}")
+            actual_s = time.monotonic() - started
+            if kind == "kv":
+                if op == "write":
+                    self.kv_sizes[key] = size
+                elif op == "delete":
+                    self.kv_sizes.pop(key, None)
+                self.kv_peak_bytes = max(self.kv_peak_bytes, sum(self.kv_sizes.values()))
+            # File length includes the NumPy header, not device or wire traffic.
+            physical = backend._get_path(key).stat().st_size if op != "delete" else 0
+            measured = {
+                "bytes": size,
+                "actual_s": actual_s,
+                "backend_s": timing.total if timing else None,
+                "physical_file_bytes": physical,
+                "kv_live_payload_bytes": sum(self.kv_sizes.values()),
+            }
+            self.trace.emit("io_actual_end", **identity, **measured)
+            estimated_s = network_delay(self.config, size)
+            await asyncio.sleep(estimated_s)
+            self.trace.emit(
+                "io_end",
+                **identity,
+                **measured,
+                modeled_network_s=estimated_s,
+                duration_s=time.monotonic() - started,
+            )
+        finally:
+            self.io_active -= 1
         return data
 
     async def rollout(self, request, semaphore):
@@ -454,7 +488,16 @@ class SyncLifecycle:
         def save_shard():
             backend = self._backend(step_dir / f"rank-{self.rank}")
             key = "state"
-            data = asyncio.run(self.io(backend, "write", key, self.config.checkpoint_bytes_per_rank, kind="checkpoint"))
+            data = asyncio.run(
+                self.io(
+                    backend,
+                    "write",
+                    key,
+                    self.config.checkpoint_bytes_per_rank,
+                    kind="checkpoint",
+                    policy=next_iteration,
+                )
+            )
             return {
                 "rank": self.rank,
                 "path": f"rank-{self.rank}/state.npy",
@@ -523,7 +566,16 @@ class SyncLifecycle:
                 ):
                     raise ValueError("checkpoint header/physical size mismatch")
             backend = self._backend(self.resume.parent / f"rank-{self.rank}")
-            payload = asyncio.run(self.io(backend, "read", "state", kind="checkpoint"))
+            payload = asyncio.run(
+                self.io(
+                    backend,
+                    "read",
+                    "state",
+                    expected_bytes,
+                    kind="checkpoint",
+                    policy=next_step,
+                )
+            )
             if payload.nbytes != self.config.checkpoint_bytes_per_rank or payload.nbytes != shard.get("bytes"):
                 raise ValueError("checkpoint byte mismatch")
             if hashlib.sha256(payload.tobytes()).hexdigest() != shard.get("sha256"):
@@ -553,6 +605,22 @@ class SyncLifecycle:
             "host": socket.gethostname(),
             "local_rank": os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", os.environ.get("MPI_LOCALRANKID", "0")),
             "active_peak": self.active_peak,
+            "io_active_peak": self.io_active_peak,
+            "kv_live_payload_bytes": sum(self.kv_sizes.values()),
+            "kv_peak_payload_bytes": self.kv_peak_bytes,
+            "prefix_hits": sum(e["event"] == "prefix_hit" for e in self.trace.events),
+            "prefix_misses": sum(e["event"] == "prefix_miss" for e in self.trace.events),
+            "generated_tokens": sum(
+                e.get("generated_tokens", 0) for e in self.trace.events if e["event"] == "rollout_complete"
+            ),
+            "iteration_elapsed_s": sum(
+                end["t_s"] - begin["t_s"]
+                for begin, end in zip(
+                    [e for e in self.trace.events if e["event"] == "iteration_begin"],
+                    [e for e in self.trace.events if e["event"] == "iteration_end"],
+                    strict=True,
+                )
+            ),
             "io": totals,
             "elapsed_s": time.monotonic() - self.trace.start,
             "modeled_network_s": sum(e.get("modeled_network_s", 0) for e in self.trace.events),
@@ -582,6 +650,7 @@ class SyncLifecycle:
         self.install_weights(self.version, initial=True)
         for iteration in range(self.start_iteration, self.config.iterations):
             self.trace.iteration = iteration
+            self.trace.emit("iteration_begin", policy=self.version)
             started = time.monotonic()
             self.phase("rollout", lambda: asyncio.run(self.rollouts()))
             self.trace.emit(
@@ -609,6 +678,7 @@ class SyncLifecycle:
                 self.checkpoint(iteration + 1)
             self.install_weights(iteration + 1)
             self.phase("KV invalidation", lambda: asyncio.run(self.invalidate()))
+            self.trace.emit("iteration_end", policy=self.version)
         ranks = self.gather_all(self.rank_summary())
         latencies = self.gather_all(
             [(f"{e['kind']}_{e['op']}", e["actual_s"]) for e in self.trace.events if e["event"] == "io_end"]
