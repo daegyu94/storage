@@ -116,7 +116,7 @@ class RoleEngine(AsyncLifecycle):
 
     def request_shape(self, request, iteration):
         # The existing calibration contract is a shared rank-0 catalog.
-        if self.config.request_profile:
+        if self.config.request_profile and self.config.request_profile["schema_version"] == 1:
             records = self.config.request_profile["records"]
             return records[(iteration * self.config.requests_per_rank + request) % len(records)]
         return super().request_shape(request, iteration)
@@ -255,24 +255,41 @@ class TrainerEngine(RoleEngine):
         await self.admission.wait()
 
     async def execute_group(self, members):
-        owner = members[0].owner
-        records = await self.endpoint.call(owner + 1, "dispatch", [asdict(s) for s in members], bounded=False)
+        owners = {state.owner for state in members}
+        subsets = await asyncio.gather(
+            *(
+                self.endpoint.call(
+                    owner + 1, "dispatch", [asdict(s) for s in members if s.owner == owner], bounded=False
+                )
+                for owner in sorted(owners)
+            )
+        )
+        records = [record for subset in subsets for record in subset]
         if len(records) != self.settings.group_size:
             raise ValueError("remote terminal group has incomplete siblings")
-        for state, record in zip(members, records, strict=True):
+        by_request = {r["request"]: r for r in records}
+        if len(by_request) != len(members) or set(by_request) != {s.request for s in members}:
+            raise ValueError("remote group/request identity mismatch")
+        for state in members:
+            record = by_request[state.request]
             if record["request"] != state.request or record["group"] != state.group:
                 raise ValueError("remote group/request identity mismatch")
             state.record, state.last_version = record, record["policy_end"]
             if self.config.persist_trajectories:
                 key = f"trajectory-g{state.group}-r{state.request}"
-                self.owners[owner]["trajectory"].metadata[key] = {"size": record["trajectory_bytes"]}
-        self.event("remote_group_complete", group=members[0].group, worker_rank=owner + 1)
+                self.owners[state.owner]["trajectory"].metadata[key] = {"size": record["trajectory_bytes"]}
+        self.event("remote_group_complete", group=members[0].group, worker_ranks=[o + 1 for o in sorted(owners)])
 
     async def dispose(self, group, disposition):
-        owner = next(s.owner for s in self.states.values() if s.group == group)
+        owners = {s.owner for s in self.states.values() if s.group == group}
         await super().dispose(group, disposition)
-        await self.endpoint.call(
-            owner + 1, "release", [group, disposition, self.version if disposition == "accepted" else None]
+        await asyncio.gather(
+            *(
+                self.endpoint.call(
+                    owner + 1, "release", [group, disposition, self.version if disposition == "accepted" else None]
+                )
+                for owner in sorted(owners)
+            )
         )
 
     async def pause(self, reason):
@@ -397,7 +414,7 @@ class TrainerEngine(RoleEngine):
             "distributed_async": True,
             "global_clock_aligned": False,
             "per_rollout_process_request_limit": self.config.concurrency,
-            "profile_mapping": "shared_rank_0_catalog",
+            "profile_mapping": result["async"]["profile_mapping"],
         }
         result["distributed"] = {
             "causal_io_overlap": self.overlap,

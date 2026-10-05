@@ -61,6 +61,15 @@ class AsyncSettings:
         return result
 
     def validate_profile_groups(self, profile, requests_per_rank):
+        if profile["schema_version"] == 2:
+            from kv_cache.agentrl_trace import profile_groups
+
+            groups = profile_groups(profile)
+            if any(len(g) != self.group_size for g in groups):
+                raise ValueError("grouped profile fanout must match group_size")
+            if any(r["owner"] >= self.rollout_owners for r in profile["records"]):
+                raise ValueError("grouped profile owner exceeds rollout_owners")
+            return
         records = profile["records"]
         if len(records) % self.group_size or requests_per_rank % self.group_size:
             raise ValueError("async profile/catalog must contain complete prompt groups")
@@ -125,6 +134,7 @@ class RequestState:
     first_version: int | None = None
     last_version: int | None = None
     record: dict | None = None
+    calibration: dict | None = None
 
 
 class AsyncLifecycle(SyncLifecycle):
@@ -143,6 +153,13 @@ class AsyncLifecycle(SyncLifecycle):
         self.retired = set()
         self.retirement_sequence = 0
         self.gc_jobs = set()
+        from kv_cache.agentrl_trace import profile_groups
+
+        self.profile_catalog = (
+            profile_groups(self.config.request_profile)
+            if self.config.request_profile and self.config.request_profile["schema_version"] == 2
+            else None
+        )
 
     def owner_root(self, owner):
         return self.storage_dir / f"rank-{self.rank}" / f"rollout-{owner}"
@@ -177,6 +194,7 @@ class AsyncLifecycle(SyncLifecycle):
                 "iteration": state.origin,
                 "owner": f"rollout-{state.owner}",
                 "policy": self.version,
+                **(state.calibration or {}),
                 **data,
             }
         self.trace.emit(name, **data)
@@ -272,10 +290,13 @@ class AsyncLifecycle(SyncLifecycle):
             self.event("generation_end", state, tokens=tokens, turn=turn)
             state.first_version = self.version if state.first_version is None else state.first_version
             state.last_version = self.version
-        if self.config.kv_cache_model is None:
-            await self.write_tokens(state, state.history, tokens, f"decode-{state.generated}")
+        previous, position = state.history, state.generated
+        # Completed decode remains observed progress even when its offload
+        # write is cancelled; io() drains that real file operation.
         state.history += tokens
         state.generated += tokens
+        if self.config.kv_cache_model is None:
+            await self.write_tokens(state, previous, tokens, f"decode-{position}")
         return duration
 
     async def request(self, state):
@@ -345,6 +366,8 @@ class AsyncLifecycle(SyncLifecycle):
                 ended = time.monotonic()
                 state.record = {
                     **state.shape,
+                    "rank": self.rank,
+                    **(state.calibration or {}),
                     "turns": observed,
                     "request": state.request,
                     "group": state.group,
@@ -368,6 +391,19 @@ class AsyncLifecycle(SyncLifecycle):
                     policy=state.last_version,
                     active=self.active - 1,
                 )
+            except asyncio.CancelledError:
+                self.event(
+                    "request_interrupted",
+                    state,
+                    reason="cancelled",
+                    generated_tokens=state.generated,
+                    planned_generated_tokens=sum(t["generated_tokens"] for t in state.shape["turns"]),
+                    history_tokens=state.history,
+                    planned_shape=state.shape,
+                    policy_start=state.first_version,
+                    policy_end=state.last_version,
+                )
+                raise
             finally:
                 if self.config.kv_cache_model is not None:
                     await self.retire_cache_request(state)
@@ -375,6 +411,33 @@ class AsyncLifecycle(SyncLifecycle):
 
     def build_group(self, group, origin, owner):
         members = []
+        profile = self.config.request_profile
+        if profile and profile["schema_version"] == 2:
+            from kv_cache.agentrl_trace import GROUP_FIELDS, RECORD_FIELDS
+
+            catalogs = self.profile_catalog
+            catalog = catalogs[group % len(catalogs)]
+            source = (group % len(catalogs)) * self.settings.group_size
+            for record in catalog:
+                identifier = group * self.settings.group_size + record["sibling"]
+                shape = {k: record[k] for k in RECORD_FIELDS}
+                state = RequestState(
+                    identifier,
+                    group,
+                    record["owner"],
+                    origin,
+                    source,
+                    shape,
+                    shape["prompt_tokens"],
+                    calibration={
+                        "sibling": record["sibling"],
+                        "calibration_source_rank": record["rank"],
+                        **{f"calibration_{k}": record[k] for k in GROUP_FIELDS if k != "sibling"},
+                    },
+                )
+                self.states[identifier] = state
+                members.append(state)
+            return members
         prompt_source = (group * self.settings.group_size) % self.config.requests_per_rank
         prompt_shape = self.request_shape(prompt_source, origin)
         prefix_id = prompt_shape["prefix_id"]
@@ -423,7 +486,14 @@ class AsyncLifecycle(SyncLifecycle):
             self.groups[group] = {"origin": origin, "status": "running"}
             self.outstanding_peak = max(self.outstanding_peak, len(self.groups))
             members = self.build_group(group, origin, owner)
-            self.event("group_dispatch", group=group, prompt_policy=origin, owner=f"rollout-{owner}")
+            self.event(
+                "group_dispatch",
+                group=group,
+                prompt_policy=origin,
+                owner=f"rollout-{members[0].owner}" if len({s.owner for s in members}) == 1 else None,
+                members=[s.request for s in members],
+                member_owners=[f"rollout-{s.owner}" for s in members],
+            )
             await self.execute_group(members)
             await self.enqueue_terminal(group)
 
@@ -619,6 +689,11 @@ class AsyncLifecycle(SyncLifecycle):
         return {
             "async": {
                 "settings": asdict(self.settings),
+                "profile_mapping": (
+                    "group_catalog_owner"
+                    if self.config.request_profile and self.config.request_profile["schema_version"] == 2
+                    else "shared_rank_0_catalog"
+                ),
                 "terminal_queue_peak": self.queue_peak,
                 "outstanding_groups_peak": self.outstanding_peak,
                 "sampled_groups": sum(e["event"] == "group_sample" for e in self.trace.events),

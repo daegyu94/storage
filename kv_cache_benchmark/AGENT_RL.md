@@ -277,7 +277,10 @@ Trainer-only and unfinished-rollout trace shards may have no completed requests 
 
 This first distributed mode requires shared storage and one trainer rank.
 Colocated MPI, multiple trainer ranks, node-local trajectory movement, dynamic NIC emulation and async resume are unsupported.
-Rank-0 joint profiles are explicitly replicated as a shared catalog; calibrated per-owner arrival/routing replay is a later adapter.
+V1 rank-0 joint profiles are replicated as a shared catalog.
+V2 grouped profiles preserve dispatch order and sibling-level owner placement, including groups spanning workers.
+The coordinator waits for all owner subsets before terminal enqueue and releases files on every participating owner.
+Arrival-time calibration and dynamic routing remain outside this catalog model.
 Use actual remote-filesystem timing with `network_mode: none`; modeled weight-sync sleep remains separate from real MPI control traffic.
 
 ## Joint request calibration and reference comparison
@@ -303,7 +306,8 @@ Decode active time excludes tool, I/O and compute queue waits so these delays ar
 The adapter must measure decode service at a declared host-visible boundary, not infer it from end-to-end request latency.
 
 Request profiles preserve these fields together and retain a canonical source SHA256.
-Profiles are sampled deterministically in input order per rank, cycling at exhaustion; source rank identities must match the launch.
+V1 profiles are sampled deterministically in input order per rank, cycling at exhaustion.
+V1 sync source ranks must match the launch; V1 async uses a shared rank-0 catalog.
 Profile prompt/turn/trajectory fields replace their scalar config counterparts; prefill rate, chunk size, offload fraction and trainer/checkpoint timing remain configured.
 Partial-prefix reuse stores the shared prefix once, then prefills/writes the request-specific suffix.
 Prefix reuse is rank-local and scoped to the installed policy version.
@@ -313,9 +317,9 @@ Runs export `trace-rank-N.json` alongside the original event arrays.
 They contain observed request active times, event boundaries and a source-code hash, with fidelity still `uncalibrated`.
 The comparison reports per-rank arrival gaps, request/tool/rate/byte distributions, operation totals, phase lags, prompt age and generated policy span separately.
 It checks I/O pairing, tool pauses, sync completion ordering and same-rank compute overlap across iteration boundaries.
-The local async runner accepts mode-matched rank-0 profiles with complete contiguous groups of `group_size` records sharing prompt/prefix shape.
-`requests_per_rank` must also be a multiple of `group_size` for profile replay; sibling turn/trajectory fields remain joint and unchanged.
-Record ordering supplies synthetic group assignment; real enqueue timestamps, dispatch groups and arrival correlations are not replayed.
+The local and separated MPI async runners accept mode-matched V1 rank-0 profiles with complete contiguous groups of `group_size` records sharing prompt/prefix shape.
+`requests_per_rank` must also be a multiple of `group_size` for V1 profile replay; sibling turn/trajectory fields remain joint and unchanged.
+V1 record ordering supplies synthetic group assignment; real enqueue timestamps, dispatch groups and arrival correlations are not replayed.
 An exported run ending with only some siblings complete may require an explicit group-aware calibration selection before conversion.
 The generic converter does not silently invent missing siblings or filter discarded samples.
 For colocated overlap checks, producers must use a common owner observation clock; unaligned process clocks cannot be relabeled as one rank.
@@ -337,3 +341,45 @@ PYTHONPATH=kv_cache_benchmark python -m pytest kv_cache_benchmark/tests \
 
 New tests cover token/byte conservation, version boundaries, actual delay feedback, queue caps, tool pauses, checkpoint recovery and real two-rank MPI failure propagation.
 MPI subprocess tests have bounded timeouts and skip only when the MPI tools are unavailable.
+
+## Grouped async calibration (V2)
+
+```bash
+python kv_cache_benchmark/agent-rl-trace.py profile --grouped \
+  --input reference-calibration --output grouped-profile.json
+python kv_cache_benchmark/agent-rl.py --config separate-async.yaml \
+  --profile grouped-profile.json --storage-root data --results-dir results --mpi
+```
+
+Use an MPI launcher for `execution: mpi_shared` or omit `--mpi` for local async.
+The input directory must include the coordinator shard and all worker shards; independent rank clocks are retained.
+This converter requires `group_dispatch` events on one coordinator clock, globally unique group/request IDs, ordered `members` and parallel `member_owners` arrays such as `["rollout-0", "rollout-1"]`.
+`member_owners` is authoritative when present.
+A legacy scalar `owner` is the fallback when the array is absent and all members share one owner.
+Each complete request must have its matching `group` and `owner` identity.
+Source collectors must join prompt uid, session identity, actual replica acquisition and backend observations explicitly; this is not a veRL native log parser.
+
+The profile envelope remains `mode`, `provenance`, `records`, with `schema_version: 2`.
+Each record has the six V1 shape fields plus sanitized `group_id`, contiguous `group_sequence`, zero-based `sibling` and integer `owner`.
+Records are in coordinator dispatch/sibling order, have fixed fanout matching `group_size`, and each source owner maps consistently to one source rank.
+Siblings share prompt/prefix geometry but may belong to different source ranks/owners.
+Every owner must fit `rollout_owners`; source rank numbers need not match the new launch.
+Runtime records use actual process rank and include `calibration_source_rank`, `calibration_group_id`, `calibration_group_sequence`, `calibration_owner` and `sibling`.
+
+Group catalogs cycle by dispatch count, independently of source iteration/policy or completion ordering.
+For V2, the catalog determines request shapes and prompt catalog length; scalar `requests_per_rank` does not select or regroup records.
+Existing outstanding credits, whole-group terminal queue, tool/compute/I/O delays, staleness and policy cadence generate new timing.
+V2 does not replay observed enqueue intervals, completion timestamps, drop/retry or GPU scheduler behavior.
+Prefill/chunk/trainer/checkpoint settings and owner generation budget remain configured.
+
+Incomplete groups are excluded as a whole and `provenance.selection` reports their IDs/reasons, included/dispatched group counts and interrupted request/token counts.
+At least one complete group is required; unsupported variable fanout or ambiguous ownership fails rather than being silently collapsed.
+This complete-group selection is subject to survivorship bias and cannot reconstruct unobserved EOS or service demand.
+A drained calibration interval and separate holdout with long-tail/censoring analysis are needed.
+`request_interrupted` events distinguish planned shape/token budget from observed generated/history tokens, including a request cancelled after generation but before publication.
+They do not become completed records or trainer samples.
+
+Comparison adds completed-owner distribution (total variation distance), complete-group fanout and same-rank completion gap.
+`cross_rank_groups` counts complete groups whose sibling clocks differ; their raw timestamps are never subtracted to create straggler latency.
+Group coverage and partial/censoring evidence must be inspected alongside marginal byte/rate agreement.
+`real_validation` remains false and all current runs remain `uncalibrated`.

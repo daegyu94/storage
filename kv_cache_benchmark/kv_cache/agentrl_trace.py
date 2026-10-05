@@ -15,6 +15,26 @@ import numpy as np
 
 MODES = ("sync", "colocate_async", "separate_async")
 KINDS = ("verl", "synthetic_fixture", "poc")
+RECORD_FIELDS = ("rank", "prompt_tokens", "prefix_tokens", "prefix_id", "trajectory_bytes", "turns")
+GROUP_FIELDS = ("group_id", "group_sequence", "sibling", "owner")
+
+
+def stable_id(value, name):
+    if not isinstance(value, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,128}", value):
+        raise ValueError(f"{name} must be a sanitized stable identifier")
+
+
+def owner_index(value):
+    if not isinstance(value, str) or not re.fullmatch(r"rollout-(0|[1-9][0-9]*)", value):
+        raise ValueError("group owner must be an explicit rollout-N identity")
+    return int(value.split("-")[1])
+
+
+def profile_groups(profile):
+    groups = defaultdict(list)
+    for record in profile["records"]:
+        groups[record["group_sequence"]].append(record)
+    return list(groups.values())
 
 
 def digest(trace):
@@ -74,8 +94,11 @@ def validate_record(record):
 def validate_profile(profile):
     if not isinstance(profile, dict) or set(profile) != {"schema_version", "mode", "provenance", "records"}:
         raise ValueError("profile envelope fields mismatch")
-    if type(profile["schema_version"]) is not int or profile["schema_version"] != 1 or profile["mode"] not in MODES:
+    version = profile["schema_version"]
+    if type(version) is not int or version not in (1, 2) or profile["mode"] not in MODES:
         raise ValueError("unsupported profile schema/mode")
+    if version == 2 and profile["mode"] == "sync":
+        raise ValueError("grouped profiles require an async mode")
     provenance = profile["provenance"]
     if not isinstance(provenance, dict) or provenance.get("kind") not in KINDS:
         raise ValueError("profile source kind missing")
@@ -84,14 +107,45 @@ def validate_profile(profile):
     records = profile["records"]
     if not isinstance(records, list) or not records:
         raise ValueError("profile must contain joint records")
-    prefixes = {}
+    prefixes, owner_ranks = {}, {}
     for record in records:
-        validate_record(record)
-        identity = (record["rank"], record["prefix_id"])
+        if version == 2:
+            if not isinstance(record, dict) or set(record) != set(RECORD_FIELDS + GROUP_FIELDS):
+                raise ValueError("grouped profile record fields mismatch")
+            validate_record({k: record[k] for k in RECORD_FIELDS})
+            stable_id(record["group_id"], "group_id")
+            for key in ("group_sequence", "sibling", "owner"):
+                number(record[key], key, integer=True)
+            owner = record["owner"]
+            if owner in owner_ranks and owner_ranks[owner] != record["rank"]:
+                raise ValueError("source owner has inconsistent rank mapping")
+            owner_ranks[owner] = record["rank"]
+        else:
+            validate_record(record)
+        identity = (record["owner"] if version == 2 else record["rank"], record["prefix_id"])
         if record["prefix_tokens"]:
             if identity in prefixes and prefixes[identity] != record["prefix_tokens"]:
                 raise ValueError("prefix identity has inconsistent geometry")
             prefixes[identity] = record["prefix_tokens"]
+    if version == 2:
+        groups = profile_groups(profile)
+        fanout, identities = len(groups[0]), set()
+        expected = []
+        for sequence, group in enumerate(groups):
+            if len(group) != fanout or [r["sibling"] for r in group] != list(range(fanout)):
+                raise ValueError("grouped profile requires complete ordered siblings and fixed fanout")
+            if any(r["group_sequence"] != sequence for r in group):
+                raise ValueError("group sequences must be contiguous dispatch order")
+            for keys in (("group_id",), ("prompt_tokens", "prefix_tokens", "prefix_id")):
+                if len({tuple(r[k] for k in keys) for r in group}) != 1:
+                    raise ValueError("group siblings must share identity and prompt geometry")
+            identity = group[0]["group_id"]
+            if identity in identities:
+                raise ValueError("duplicate source group identity")
+            identities.add(identity)
+            expected.extend(group)
+        if records != expected:
+            raise ValueError("grouped records must follow dispatch/sibling order")
     return profile
 
 
@@ -164,6 +218,11 @@ def validate_trace(trace):
                 number(event.get("actual_s"), "actual I/O latency")
         if event["event"] == "rollout_start":
             number(event.get("queue_wait_s"), "admission wait")
+        if event["event"] == "request_interrupted":
+            for name in ("request", "generated_tokens", "planned_generated_tokens", "history_tokens"):
+                number(event.get(name), name, integer=True)
+            if event["generated_tokens"] > event["planned_generated_tokens"]:
+                raise ValueError("partial progress exceeds planned token budget")
     return trace
 
 
@@ -189,8 +248,118 @@ def load_trace(path):
     return validate_trace(json.loads(path.read_text()))
 
 
-def make_profile(trace):
+def group_observations(trace):
+    """Pair globally unique coordinator group IDs with same-clock siblings.
+
+    No completion timestamp is used to order dispatches across ranks.
+    """
+    dispatches = [e for e in trace["events"] if e["event"] == "group_dispatch"]
+    if not dispatches or len({e["rank"] for e in dispatches}) != 1:
+        raise ValueError("grouped calibration requires one coordinator dispatch clock")
+    dispatches.sort(key=lambda e: e["t_s"])
+    groups, seen_requests = {}, set()
+    for event in dispatches:
+        group = event.get("group")
+        if type(group) not in (int, str):
+            raise ValueError("group identity missing")
+        identity = f"group-{group}" if type(group) is int else group
+        stable_id(identity, "group_id")
+        members = event.get("members")
+        if not isinstance(members, list) or not members:
+            raise ValueError("dispatch requires ordered member request IDs")
+        for member in members:
+            number(member, "group member", integer=True)
+        owners = event.get("member_owners")
+        if owners is None:
+            owners = [event.get("owner")] * len(members)
+        if not isinstance(owners, list) or len(owners) != len(members):
+            raise ValueError("dispatch member owner count mismatch")
+        owners = [owner_index(owner) for owner in owners]
+        if len(set(members)) != len(members) or seen_requests.intersection(members):
+            raise ValueError("duplicate dispatched request identity")
+        if group in groups:
+            raise ValueError("duplicate group dispatch")
+        seen_requests.update(members)
+        groups[group] = {
+            "source_group": group,
+            "group_id": identity,
+            "owners": dict(zip(members, owners, strict=True)),
+            "members": members,
+            "requests": {},
+        }
+    for request in trace["requests"]:
+        group = groups.get(request.get("group"))
+        if group is None or request["request"] not in group["members"]:
+            raise ValueError("request has no matching group dispatch")
+        if owner_index(request.get("owner")) != group["owners"][request["request"]]:
+            raise ValueError("request/dispatch owner mismatch")
+        if request["request"] in group["requests"]:
+            raise ValueError("duplicate group sibling")
+        group["requests"][request["request"]] = request
+    return list(groups.values())
+
+
+def make_group_profile(trace):
+    if trace["mode"] == "sync":
+        raise ValueError("grouped calibration requires an async mode")
+    groups = group_observations(trace)
+    if len({len(g["members"]) for g in groups}) != 1:
+        raise ValueError("grouped replay does not support variable fanout")
+    records, excluded = [], []
+    included = 0
+    for group in groups:
+        if len(group["requests"]) != len(group["members"]):
+            excluded.append({"group_id": group["group_id"], "reason": "incomplete_siblings"})
+            continue
+        for sibling, member in enumerate(group["members"]):
+            request = group["requests"][member]
+            records.append(
+                {
+                    **{k: request[k] for k in RECORD_FIELDS},
+                    "group_id": group["group_id"],
+                    "group_sequence": included,
+                    "sibling": sibling,
+                    "owner": group["owners"][member],
+                }
+            )
+        included += 1
+    interrupted = [e for e in trace["events"] if e["event"] == "request_interrupted"]
+    membership = {member: group for group in groups for member in group["members"]}
+    seen_partial = set()
+    for event in interrupted:
+        member = event["request"]
+        group = membership.get(member)
+        if group is None or event.get("group") != group["source_group"]:
+            raise ValueError("interrupted request has no group dispatch")
+        if member in seen_partial or member in group["requests"]:
+            raise ValueError("duplicate/completed interrupted request")
+        if owner_index(event.get("owner")) != group["owners"][member]:
+            raise ValueError("interrupted request owner mismatch")
+        seen_partial.add(member)
+    return validate_profile(
+        {
+            "schema_version": 2,
+            "mode": trace["mode"],
+            "records": records,
+            "provenance": {
+                **trace["provenance"],
+                "source_sha256": digest(trace),
+                "selection": {
+                    "dispatched_groups": len(groups),
+                    "included_groups": included,
+                    "excluded_groups": excluded,
+                    "interrupted_requests": len(interrupted),
+                    "interrupted_generated_tokens": sum(e["generated_tokens"] for e in interrupted),
+                },
+            },
+        }
+    )
+
+
+def make_profile(trace, *, grouped=False):
     validate_trace(trace)
+    if grouped:
+        return make_group_profile(trace)
     names = ("rank", "prompt_tokens", "prefix_tokens", "prefix_id", "trajectory_bytes", "turns")
     records = [
         {k: r[k] for k in names}
@@ -309,6 +478,33 @@ def analyze_trace(trace):
             metrics[f"{key}_total"] = [sum(metrics[key])]
             metrics[f"{key}_op_count"] = [len(metrics[key])]
     metrics["request_count"] = [len(trace["requests"])]
+    owners = defaultdict(int)
+    for request in trace["requests"]:
+        if "owner" in request:
+            owners[request["owner"]] += 1
+    if owners:
+        metrics["completed_requests_by_owner"] = dict(owners)
+    if any(e["event"] == "group_dispatch" and "members" in e for e in trace["events"]):
+        try:
+            observations = group_observations(trace)
+            cross_rank = 0
+            for group in observations:
+                siblings = list(group["requests"].values())
+                if len(siblings) == len(group["members"]):
+                    metrics["group_fanout"].append(len(siblings))
+                    if len({r["rank"] for r in siblings}) == 1:
+                        ends = [r["end_s"] for r in siblings]
+                        metrics["group_straggler_s"].append(max(ends) - min(ends))
+                    else:
+                        cross_rank += 1
+            metrics["cross_rank_groups"] = [cross_rank]
+            metrics["censored_groups"] = [sum(len(g["requests"]) < len(g["members"]) for g in observations)]
+        except ValueError as exc:
+            violations.append(str(exc))
+    partials = [e for e in trace["events"] if e["event"] == "request_interrupted"]
+    if partials:
+        metrics["interrupted_generated_tokens"] = [e["generated_tokens"] for e in partials]
+        metrics["interrupted_planned_tokens"] = [e["planned_generated_tokens"] for e in partials]
     return {**metrics, "violations": violations}
 
 
@@ -330,6 +526,20 @@ def compare_traces(reference, candidate, *, relative_tolerance=0.25, ks_toleranc
         if not a or not b:
             comparisons[key] = {"coverage_match": False, "pass": False}
             passed = False
+            continue
+        if isinstance(a, dict) and isinstance(b, dict):
+            categories = sorted(set(a) | set(b))
+            total_a, total_b = sum(a.values()), sum(b.values())
+            distance = 0.5 * sum(abs(a.get(k, 0) / total_a - b.get(k, 0) / total_b) for k in categories)
+            accepted = distance <= ks_tolerance
+            comparisons[key] = {
+                "coverage_match": True,
+                "reference": a,
+                "candidate": b,
+                "total_variation_distance": distance,
+                "pass": accepted,
+            }
+            passed = passed and accepted
             continue
         qa, qb = np.percentile(a, (50, 95, 99)), np.percentile(b, (50, 95, 99))
         relative = float(np.max(np.abs(qb - qa) / np.maximum(np.abs(qa), 1e-9)))

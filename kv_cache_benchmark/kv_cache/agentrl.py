@@ -101,7 +101,11 @@ class AgentRLConfig:
             validate_profile(self.request_profile)
             if self.request_profile["mode"] != self.trainer_mode:
                 raise ValueError(f"profile mode must match trainer_mode={self.trainer_mode}")
-            if self.trainer_mode != "sync" and any(r["rank"] != 0 for r in self.request_profile["records"]):
+            if (
+                self.trainer_mode != "sync"
+                and self.request_profile["schema_version"] == 1
+                and any(r["rank"] != 0 for r in self.request_profile["records"])
+            ):
                 raise ValueError("local async supports rank-0 profiles only")
             if self.request_profile["provenance"].get("observation_boundary") != "host_file_api":
                 raise ValueError("profile requires host_file_api observation boundary")
@@ -353,8 +357,13 @@ class SyncLifecycle:
         if self.config.kv_cache_model is not None and self.config.trainer_mode == "sync":
             self.cache_pools[self.rank] = self.make_cache_pool(self.rank, self.kv)
         steps = range(self.config.iterations) if self.config.request_profile else (0,)
+        catalog_size = (
+            len(self.config.request_profile["records"])
+            if self.config.request_profile and self.config.request_profile["schema_version"] == 2
+            else self.config.requests_per_rank
+        )
         for iteration in steps:
-            for request in range(self.config.requests_per_rank):
+            for request in range(catalog_size):
                 key = self.prompt_key(request, iteration)
                 shape = self.request_shape(request, iteration)
                 self.prompts.write(key, self.payload(key, shape["prompt_tokens"] * 4))
@@ -540,6 +549,8 @@ class SyncLifecycle:
     def request_shape(self, request, iteration):
         config = self.config
         if config.request_profile:
+            if config.request_profile["schema_version"] == 2:
+                return config.request_profile["records"][request % len(config.request_profile["records"])]
             records = [r for r in config.request_profile["records"] if r["rank"] == self.rank]
             if not records:
                 raise ValueError(f"profile has no records for rank {self.rank}")

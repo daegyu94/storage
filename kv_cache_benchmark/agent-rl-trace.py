@@ -15,6 +15,9 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     profile = commands.add_parser("profile")
     profile.add_argument("--input", type=Path, required=True)
+    profile.add_argument(
+        "--grouped", action="store_true", help="Preserve async coordinator groups and rollout owners (V2)"
+    )
     compare = commands.add_parser("compare")
     compare.add_argument("--reference", type=Path, required=True)
     compare.add_argument("--candidate", type=Path, required=True)
@@ -25,7 +28,7 @@ def main():
     args = parser.parse_args()
     try:
         if args.command == "profile":
-            data = make_profile(load_trace(args.input))
+            data = make_profile(load_trace(args.input), grouped=args.grouped)
         else:
             data = compare_traces(
                 load_trace(args.reference),
