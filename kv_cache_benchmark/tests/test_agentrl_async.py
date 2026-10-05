@@ -286,3 +286,16 @@ def test_joint_profile_and_offload_work_in_both_local_async_modes(tmp_path, mode
     assert summary["ranks"][0]["kv_live_payload_bytes"] == 0
     kv = [e for e in runner.trace.events if e["event"] == "io_begin" and e["kind"] == "kv"]
     assert bool(kv) is (fraction > 0)
+
+
+def test_async_metrics_count_partial_decode_and_distinguish_catalog_from_admission(tmp_path):
+    config = replace(async_config(), iterations=1, concurrency=6, response_tokens=[2, 2, 40, 40])
+    runner, summary = execute(tmp_path, config)
+    rank = summary["ranks"][0]
+    assert rank["admission_worker_limit"] == 6  # requests_per_rank=4 is a shape catalog here.
+    decoded = sum(e["tokens"] for e in runner.trace.events if e["event"] == "generation_end")
+    assert rank["decoded_tokens"] == decoded
+    assert rank["unfinished_generated_tokens"] == decoded - rank["generated_tokens"] > 0
+    phase = next(e["t_s"] for e in runner.trace.events if e["event"] == "rollout_phase_begin")
+    end = next(e["t_s"] for e in runner.trace.events if e["event"] == "rollout_phase_end")
+    assert rank["achieved_decode_tokens_per_s"] == pytest.approx(decoded / (end - phase))

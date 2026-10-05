@@ -176,6 +176,11 @@ Async multi-rank launch is rejected before I/O because a distributed role/queue/
 Sync MPI behavior is preserved.
 Async checkpoints contain real shard/manifest I/O but mark `inflight_recoverable: false`; async `--resume` is rejected.
 Source hashes, effective settings, queue/window peaks and completion dispositions support reproduction while fidelity remains `uncalibrated`.
+Async `requests_per_rank` is a shape catalog size, not a fixed offered batch or admission cap.
+Async `decoded_tokens` counts every completed decode chunk, including unfinished requests discarded at shutdown.
+`generated_tokens` retains the completed-request total, and `unfinished_generated_tokens` records the difference.
+Async achieved decode rate uses all decoded tokens over the full rollout phase, including training/transition pauses and final GC.
+It is a workload wall-time rate, not measured GPU service throughput.
 
 ## Joint request calibration and reference comparison
 

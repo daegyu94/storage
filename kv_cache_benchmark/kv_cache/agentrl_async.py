@@ -546,6 +546,19 @@ class AsyncLifecycle(SyncLifecycle):
     def checkpoint_metadata(self):
         return {"lifecycle_mode": self.config.trainer_mode, "inflight_recoverable": False}
 
+    def rank_summary(self):
+        summary = super().rank_summary()
+        decoded = sum(e["tokens"] for e in self.trace.events if e["event"] == "generation_end")
+        begin = next(e["t_s"] for e in self.trace.events if e["event"] == "rollout_phase_begin")
+        end = next(e["t_s"] for e in self.trace.events if e["event"] == "rollout_phase_end")
+        return {
+            **summary,
+            "admission_worker_limit": self.config.concurrency,
+            "decoded_tokens": decoded,
+            "unfinished_generated_tokens": decoded - summary["generated_tokens"],
+            "achieved_decode_tokens_per_s": decoded / (end - begin),
+        }
+
     def summary_fields(self):
         return {
             "async": {
