@@ -17,7 +17,7 @@ def main():
     parser.add_argument("--results-dir", required=True, type=Path)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--profile", type=Path, help="Joint normalized request profile matching trainer_mode")
-    parser.add_argument("--mpi", action="store_true", help="Use mpi4py collectives under an MPI launcher")
+    parser.add_argument("--mpi", action="store_true", help="Connect the workload to its MPI launcher")
     args = parser.parse_args()
     comm = None
     try:

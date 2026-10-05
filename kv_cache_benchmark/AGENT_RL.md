@@ -42,7 +42,8 @@ Multiple admitted requests overlap their compute delays and threaded I/O; a requ
 `AgentRLConfig` in `kv_cache/agentrl.py` is the canonical schema and rejects unknown fields.
 JSON and YAML configurations are supported; omitted fields use dataclass defaults recorded in `config.json`.
 `trainer_mode` accepts `sync`, `colocate_async` and `separate_async`.
-Sync supports MPI; async currently supports one process with explicit logical owners.
+Sync supports MPI; async defaults to one process with explicit logical owners.
+Standalone separated async also supports opt-in shared-filesystem MPI execution below.
 
 | Fields | Meaning |
 | --- | --- |
@@ -172,7 +173,7 @@ Accepted requests have disposition `accepted` and the policy at actual sampling.
 
 Every rollout owner has a real KV/trajectory namespace on the same filesystem; trainer and GC I/O have explicit role tags.
 Owner count is a synthetic compute/storage concurrency parameter, not measured physical node or GPU count.
-Async multi-rank launch is rejected before I/O because a distributed role/queue/version/failure protocol has not been implemented.
+Local async multi-rank launch is rejected before I/O; use the explicit separated MPI topology below.
 Sync MPI behavior is preserved.
 Async checkpoints contain real shard/manifest I/O but mark `inflight_recoverable: false`; async `--resume` is rejected.
 Source hashes, effective settings, queue/window peaks and completion dispositions support reproduction while fidelity remains `uncalibrated`.
@@ -181,6 +182,61 @@ Async `decoded_tokens` counts every completed decode chunk, including unfinished
 `generated_tokens` retains the completed-request total, and `unfinished_generated_tokens` records the difference.
 Async achieved decode rate uses all decoded tokens over the full rollout phase, including training/transition pauses and final GC.
 It is a workload wall-time rate, not measured GPU service throughput.
+
+## Separated MPI execution
+
+Set `trainer_mode: separate_async`, `generation_rate_scope: owner`, and `network_mode: none`.
+The settings below use one trainer/coordinator rank and two rollout ranks:
+
+```yaml
+async_workload:
+  execution: mpi_shared
+  rollout_owners: 2
+  group_size: 2
+  batch_groups: 1
+  outstanding_groups: 4
+  queue_capacity: 2
+  parameter_sync_step: 2
+  max_prompt_age: null
+  staleness_strategy: drop
+  kv_gc_delay_s: 0.01
+  rpc_timeout_s: 30
+```
+
+```bash
+mpiexec -n 3 python kv_cache_benchmark/agent-rl.py --mpi \
+  --config agentrl.yaml --storage-root shared/data --results-dir shared/results
+```
+
+Rank 0 trains; ranks 1 through N each execute one rollout owner, with `rollout_owners = world_size - 1`.
+Rank is a process identity: topology records rank roles, process IDs and observed hostname aliases separately.
+Observed hostname domains do not certify physical node identity, container placement or accelerator counts.
+All ranks need the same code/configuration and mutually visible POSIX storage/results directories; setup checks fresh run markers in both directories.
+Actual trajectory files cross the producer/trainer boundary; no tensor payload is substituted with an MPI message.
+KV remains owner-scoped, while trainer reads/deletes the shared trajectory namespace.
+Unconsumed worker trajectories are deleted with role `gc`; accepted trajectory reads are trainer I/O.
+
+Coordinator credits and the terminal queue are global; `concurrency` limits requests per rollout process.
+Per-owner compute rates and global group fanout/window must be held explicit when comparing pool ratios.
+Checkpoint payloads belong to trainer rank 0 only; the manifest's shard `world_size` is 1, with `execution_world_size` and `trainer_ranks` recording the separate execution topology.
+Pause and KV retirement acknowledgments precede each owner policy install, and all install acknowledgments precede coordinator dispatch under the new version.
+No new group is dispatched under the final policy after the last configured iteration.
+
+MPI collectives occur only during setup and after role tasks stop for reporting.
+A single event-loop progress task multiplexes nonblocking metadata/control messages; its polling/instrumentation overhead is part of observed host time, not a calibrated NIC delay.
+The RPC timeout bounds control commands, not legitimate full trajectory duration.
+Worker/GC/trainer storage failures fail the MPI job; this is not fault-tolerant MPI or asynchronous replay recovery.
+
+`distributed.causal_io_overlap` and its per-kind/op breakdown count operations whose phase token was frozen at `io_begin` and whose completion was received before trainer phase end.
+The trainer phase start causes token delivery before that I/O begins, so the chain establishes overlap without comparing cross-rank timestamps.
+Operations received after phase end are not counted even if their token matches.
+Raw traces retain independent rank-local clocks and I/O IDs; no global concurrency peak is inferred by summing rank peaks.
+Trainer-only and unfinished-rollout trace shards may have no completed requests but preserve their role and actual events.
+
+This first distributed mode requires shared storage and one trainer rank.
+Colocated MPI, multiple trainer ranks, node-local trajectory movement, dynamic NIC emulation and async resume are unsupported.
+Rank-0 joint profiles are explicitly replicated as a shared catalog; calibrated per-owner arrival/routing replay is a later adapter.
+Use actual remote-filesystem timing with `network_mode: none`; modeled weight-sync sleep remains separate from real MPI control traffic.
 
 ## Joint request calibration and reference comparison
 

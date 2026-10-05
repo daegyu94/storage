@@ -114,7 +114,7 @@ def validate_trace(trace):
         raise ValueError("trace provenance or rank_local clock missing")
     if (
         not isinstance(trace.get("requests"), list)
-        or not trace["requests"]
+        or (not trace["requests"] and trace.get("execution_role") not in ("trainer", "rollout"))
         or not isinstance(trace.get("events"), list)
     ):
         raise ValueError("trace requires requests and events lists")
@@ -256,7 +256,7 @@ def analyze_trace(trace):
             violations.append(f"I/O boundary mismatch {identity}")
         if any(
             len({e.get(k) for e in pairs.values()}) != 1
-            for k in ("op", "kind", "key", "request", "policy", "iteration")
+            for k in ("op", "kind", "key", "request", "policy", "iteration", "owner", "role", "phase_token")
         ):
             violations.append(f"I/O identity mismatch {identity}")
     for identity, events in grouped.items():

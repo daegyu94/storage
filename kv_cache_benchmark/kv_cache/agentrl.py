@@ -358,6 +358,12 @@ class SyncLifecycle:
         )
         return np.random.default_rng(seed).integers(0, 256, size=size, dtype=np.uint8)
 
+    def io_context(self):
+        return {}
+
+    def io_completed(self, identity):
+        pass
+
     async def io(
         self, backend, op, key, size=None, *, kind, request=None, policy=None, iteration=None, owner=None, role=None
     ):
@@ -374,6 +380,7 @@ class SyncLifecycle:
             "iteration": self.trace.iteration if iteration is None else iteration,
             "owner": owner,
             "role": role,
+            **self.io_context(),
         }
         self.io_sequence += 1
         self.io_active += 1
@@ -418,6 +425,7 @@ class SyncLifecycle:
                 modeled_network_s=estimated_s,
                 duration_s=time.monotonic() - started,
             )
+            self.io_completed(identity)
         finally:
             self.io_active -= 1
         return data
@@ -666,8 +674,12 @@ class SyncLifecycle:
     def checkpoint_metadata(self):
         return {}
 
+    async def checkpoint_observation(self, begin):
+        pass
+
     async def async_checkpoint(self, next_iteration):
         self.trace.emit("checkpoint_begin", policy=next_iteration)
+        await self.checkpoint_observation(True)
         step_dir = self.storage_dir / "checkpoints" / f"step-{next_iteration}"
 
         async def save_shard():
@@ -706,6 +718,7 @@ class SyncLifecycle:
 
         await self.async_phase("checkpoint commit", commit)
         self.trace.emit("checkpoint_commit", policy=next_iteration)
+        await self.checkpoint_observation(False)
         self.trace.emit("checkpoint_end", policy=next_iteration)
 
     def recover(self):
@@ -883,6 +896,12 @@ class SyncLifecycle:
     def summary_fields(self):
         return {}
 
+    def normalized_trace_fields(self):
+        return {}
+
+    def export_trace(self):
+        return bool(self.completed_requests)
+
     def publish_results(self):
         ranks = self.gather_all(self.rank_summary())
         latencies = self.gather_all(
@@ -921,7 +940,7 @@ class SyncLifecycle:
             **self.summary_fields(),
         }
         self.phase("results", lambda: self.write_json(self.result_dir / f"rank-{self.rank}.json", self.trace.events))
-        if self.completed_requests:
+        if self.export_trace():
             provenance = {
                 "kind": "poc",
                 "run_id": self.result_dir.name,
@@ -929,7 +948,14 @@ class SyncLifecycle:
                 + hashlib.sha256(
                     b"".join(
                         (Path(__file__).parent / name).read_bytes()
-                        for name in ("agentrl.py", "agentrl_async.py", "agentrl_trace.py", "backends.py", "models.py")
+                        for name in (
+                            "agentrl.py",
+                            "agentrl_async.py",
+                            "agentrl_mpi.py",
+                            "agentrl_trace.py",
+                            "backends.py",
+                            "models.py",
+                        )
                         if (Path(__file__).parent / name).exists()
                     )
                 ).hexdigest(),
@@ -944,6 +970,7 @@ class SyncLifecycle:
                 "provenance": provenance,
                 "requests": self.completed_requests,
                 "events": self.trace.events,
+                **self.normalized_trace_fields(),
             }
         else:
             normalized = None
@@ -963,5 +990,10 @@ def create_lifecycle(config, storage_root, results_dir, **kwargs):
     if config.trainer_mode == "sync":
         return SyncLifecycle(config, storage_root, results_dir, **kwargs)
     from kv_cache.agentrl_async import AsyncLifecycle
+
+    if config.async_workload and config.async_workload.get("execution") == "mpi_shared":
+        from kv_cache.agentrl_mpi import MPILifecycle
+
+        return MPILifecycle(config, storage_root, results_dir, **kwargs)
 
     return AsyncLifecycle(config, storage_root, results_dir, **kwargs)

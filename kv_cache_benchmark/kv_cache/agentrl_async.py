@@ -14,6 +14,8 @@ from kv_cache.agentrl import SyncLifecycle, kv_delta_bytes, network_delay
 
 @dataclass(frozen=True)
 class AsyncSettings:
+    execution: str = "local"
+    rpc_timeout_s: float = 30.0
     group_size: int = 2
     batch_groups: int = 1
     outstanding_groups: int = 4
@@ -29,6 +31,8 @@ class AsyncSettings:
         if not isinstance(values, dict) or set(values) - {f.name for f in fields(cls)}:
             raise ValueError("async_workload must be a mapping of known settings")
         result = cls(**values)
+        if result.execution not in ("local", "mpi_shared"):
+            raise ValueError("async execution must be local or mpi_shared")
         for name in (
             "group_size",
             "batch_groups",
@@ -48,6 +52,9 @@ class AsyncSettings:
         from kv_cache.agentrl_trace import number
 
         number(result.kv_gc_delay_s, "kv_gc_delay_s")
+        number(result.rpc_timeout_s, "rpc_timeout_s")
+        if result.rpc_timeout_s <= 0:
+            raise ValueError("rpc_timeout_s must be positive")
         if mode == "colocate_async" and result.parameter_sync_step != 1:
             raise ValueError("colocate_async uses a full batch, parameter_sync_step must be 1")
         return result
@@ -134,12 +141,16 @@ class AsyncLifecycle(SyncLifecycle):
         self.next_group = self.queue_peak = self.outstanding_peak = 0
         self.retired = set()
         self.retirement_sequence = 0
+        self.gc_jobs = set()
+
+    def owner_root(self, owner):
+        return self.storage_dir / f"rank-{self.rank}" / f"rollout-{owner}"
 
     def setup(self):
         super().setup()
         self.owners = []
         for owner in range(self.settings.rollout_owners):
-            root = self.storage_dir / f"rank-{self.rank}" / f"rollout-{owner}"
+            root = self.owner_root(owner)
             self.owners.append(
                 {
                     "kv": self._backend(root / "kv"),
@@ -340,43 +351,59 @@ class AsyncLifecycle(SyncLifecycle):
             finally:
                 self.active -= 1
 
+    def build_group(self, group, origin, owner):
+        members = []
+        prompt_source = (group * self.settings.group_size) % self.config.requests_per_rank
+        prompt_shape = self.request_shape(prompt_source, origin)
+        prefix_id = prompt_shape["prefix_id"]
+        if not self.config.request_profile and str(prefix_id).startswith("cold-"):
+            prefix_id = f"cold-group-{group}"
+        for sibling in range(self.settings.group_size):
+            identifier = group * self.settings.group_size + sibling
+            source = identifier % self.config.requests_per_rank
+            shape = self.request_shape(source, origin)
+            if not self.config.request_profile:
+                shape = {**shape, "prefix_id": prefix_id}
+            state = RequestState(identifier, group, owner, origin, prompt_source, shape, shape["prompt_tokens"])
+            self.states[identifier] = state
+            members.append(state)
+        return members
+
+    async def admit_group(self):
+        pass
+
+    async def execute_group(self, members):
+        async with asyncio.TaskGroup() as children:
+            for state in members:
+                children.create_task(self.request(state))
+
+    async def enqueue_terminal(self, group):
+        self.groups[group]["status"] = "terminal"
+        async with self.condition:
+            self.condition.notify_all()
+            if len(self.ready) == self.settings.queue_capacity:
+                self.event("queue_backpressure", group=group, queue_depth=len(self.ready))
+            await self.condition.wait_for(lambda: len(self.ready) < self.settings.queue_capacity)
+            self.ready.append(group)
+            self.queue_peak = max(self.queue_peak, len(self.ready))
+            self.event(
+                "group_ready", group=group, prompt_policy=self.groups[group]["origin"], queue_depth=len(self.ready)
+            )
+            self.condition.notify_all()
+
     async def producer(self):
         while True:
             await self.credits.acquire()
+            await self.admit_group()
             group = self.next_group
             self.next_group += 1
             origin, owner = self.version, group % self.settings.rollout_owners
             self.groups[group] = {"origin": origin, "status": "running"}
             self.outstanding_peak = max(self.outstanding_peak, len(self.groups))
-            members = []
-            prompt_source = (group * self.settings.group_size) % self.config.requests_per_rank
-            prompt_shape = self.request_shape(prompt_source, origin)
-            prefix_id = prompt_shape["prefix_id"]
-            if not self.config.request_profile and str(prefix_id).startswith("cold-"):
-                prefix_id = f"cold-group-{group}"
-            for sibling in range(self.settings.group_size):
-                identifier = group * self.settings.group_size + sibling
-                source = identifier % self.config.requests_per_rank
-                shape = self.request_shape(source, origin)
-                if not self.config.request_profile:
-                    shape = {**shape, "prefix_id": prefix_id}
-                state = RequestState(identifier, group, owner, origin, prompt_source, shape, shape["prompt_tokens"])
-                self.states[identifier] = state
-                members.append(state)
+            members = self.build_group(group, origin, owner)
             self.event("group_dispatch", group=group, prompt_policy=origin, owner=f"rollout-{owner}")
-            async with asyncio.TaskGroup() as children:
-                for state in members:
-                    children.create_task(self.request(state))
-            self.groups[group]["status"] = "terminal"
-            async with self.condition:
-                self.condition.notify_all()
-                if len(self.ready) == self.settings.queue_capacity:
-                    self.event("queue_backpressure", group=group, queue_depth=len(self.ready))
-                await self.condition.wait_for(lambda: len(self.ready) < self.settings.queue_capacity)
-                self.ready.append(group)
-                self.queue_peak = max(self.queue_peak, len(self.ready))
-                self.event("group_ready", group=group, prompt_policy=origin, queue_depth=len(self.ready))
-                self.condition.notify_all()
+            await self.execute_group(members)
+            await self.enqueue_terminal(group)
 
     def stale(self, group, *, terminal):
         return age_blocks(
@@ -393,14 +420,11 @@ class AsyncLifecycle(SyncLifecycle):
                 state.record["trainer_policy_at_accept"] = self.version if disposition == "accepted" else None
             if self.config.persist_trajectories:
                 key = f"trajectory-g{group}-r{state.request}"
+                role = "trainer" if disposition == "accepted" else "gc"
                 if disposition == "accepted" and state.record:
-                    await self.request_io(
-                        state, "read", key, kind="trajectory", role="trainer", policy=state.last_version
-                    )
+                    await self.request_io(state, "read", key, kind="trajectory", role=role, policy=state.last_version)
                 if key in self.owners[state.owner]["trajectory"].metadata:
-                    await self.request_io(
-                        state, "delete", key, kind="trajectory", role="trainer", policy=state.last_version
-                    )
+                    await self.request_io(state, "delete", key, kind="trajectory", role=role, policy=state.last_version)
             self.states.pop(state.request)
 
     async def sample(self):
@@ -466,7 +490,9 @@ class AsyncLifecycle(SyncLifecycle):
             keys=[k for _, k in snapshot],
             modeled_gc_delay_s=self.settings.kv_gc_delay_s,
         )
-        self.jobs.create_task(self.gc(snapshot, retirement, self.version, self.trace.iteration))
+        task = self.jobs.create_task(self.gc(snapshot, retirement, self.version, self.trace.iteration))
+        self.gc_jobs.add(task)
+        task.add_done_callback(self.gc_jobs.discard)
 
     async def gc(self, snapshot, retirement, version, iteration):
         await asyncio.sleep(self.settings.kv_gc_delay_s)
