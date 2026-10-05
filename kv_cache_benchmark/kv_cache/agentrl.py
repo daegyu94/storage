@@ -338,7 +338,9 @@ class SyncLifecycle:
         )
         return np.random.default_rng(seed).integers(0, 256, size=size, dtype=np.uint8)
 
-    async def io(self, backend, op, key, size=0, *, kind, request=None, policy=None):
+    async def io(
+        self, backend, op, key, size=0, *, kind, request=None, policy=None, iteration=None, owner=None, role=None
+    ):
         if op == "read" and not size:
             size = backend.metadata[key]["size"]
         data = self.payload(key, size) if op == "write" else None
@@ -349,6 +351,9 @@ class SyncLifecycle:
             "kind": kind,
             "request": request,
             "policy": self.version if policy is None else policy,
+            "iteration": self.trace.iteration if iteration is None else iteration,
+            "owner": owner,
+            "role": role,
         }
         self.io_sequence += 1
         self.io_active += 1
@@ -624,22 +629,38 @@ class SyncLifecycle:
         finally:
             os.close(fd)
 
+    async def async_phase(self, name, action):
+        result, error = None, None
+        try:
+            result = await action()
+        except Exception as exc:
+            error = f"rank {self.rank} {name}: {exc!r}"
+        errors = [e for e in self.gather_all(error) if e]
+        if errors:
+            raise RuntimeError("; ".join(errors))
+        return result
+
     def checkpoint(self, next_iteration):
+        return asyncio.run(self.async_checkpoint(next_iteration))
+
+    def checkpoint_metadata(self):
+        return {}
+
+    async def async_checkpoint(self, next_iteration):
         self.trace.emit("checkpoint_begin", policy=next_iteration)
         step_dir = self.storage_dir / "checkpoints" / f"step-{next_iteration}"
 
-        def save_shard():
+        async def save_shard():
             backend = self._backend(step_dir / f"rank-{self.rank}")
-            key = "state"
-            data = asyncio.run(
-                self.io(
-                    backend,
-                    "write",
-                    key,
-                    self.config.checkpoint_bytes_per_rank,
-                    kind="checkpoint",
-                    policy=next_iteration,
-                )
+            data = await self.io(
+                backend,
+                "write",
+                "state",
+                self.config.checkpoint_bytes_per_rank,
+                kind="checkpoint",
+                policy=next_iteration,
+                owner="trainer",
+                role="trainer",
             )
             return {
                 "rank": self.rank,
@@ -648,20 +669,22 @@ class SyncLifecycle:
                 "sha256": hashlib.sha256(data.tobytes()).hexdigest(),
             }
 
-        shard = self.phase("checkpoint shard", save_shard)
-        shards = self.gather_all(shard)
+        shard = await self.async_phase("checkpoint shard", save_shard)
         manifest = {
             "schema_version": 1,
             "policy_version": next_iteration,
             "next_iteration": next_iteration,
             "world_size": self.world,
             "config_sha256": self.config.fingerprint,
-            "shards": shards,
+            "shards": self.gather_all(shard),
+            **self.checkpoint_metadata(),
         }
-        self.phase(
-            "checkpoint commit",
-            lambda: self.write_json(step_dir / "manifest.json", manifest) if self.rank == 0 else None,
-        )
+
+        async def commit():
+            if self.rank == 0:
+                await asyncio.to_thread(self.write_json, step_dir / "manifest.json", manifest)
+
+        await self.async_phase("checkpoint commit", commit)
         self.trace.emit("checkpoint_commit", policy=next_iteration)
         self.trace.emit("checkpoint_end", policy=next_iteration)
 
@@ -835,6 +858,12 @@ class SyncLifecycle:
             self.install_weights(iteration + 1)
             self.phase("KV invalidation", lambda: asyncio.run(self.invalidate()))
             self.trace.emit("iteration_end", policy=self.version)
+        return self.publish_results()
+
+    def summary_fields(self):
+        return {}
+
+    def publish_results(self):
         ranks = self.gather_all(self.rank_summary())
         latencies = self.gather_all(
             [(f"{e['kind']}_{e['op']}", e["actual_s"]) for e in self.trace.events if e["event"] == "io_end"]
@@ -859,7 +888,7 @@ class SyncLifecycle:
             "status": "complete",
             "benchmark": "experimental-agentrl",
             "fidelity": "uncalibrated",
-            "trainer_mode": "sync",
+            "trainer_mode": self.config.trainer_mode,
             "world_size": self.world,
             "final_policy_version": self.version,
             "config_sha256": self.config.fingerprint,
@@ -869,6 +898,7 @@ class SyncLifecycle:
             "io_totals": totals,
             "latency_by_kind_op_s": {k: quantiles(v) for k, v in by_kind.items()},
             "io_latency_s": quantiles(flat_latencies) if flat_latencies else {},
+            **self.summary_fields(),
         }
         self.phase("results", lambda: self.write_json(self.result_dir / f"rank-{self.rank}.json", self.trace.events))
         if self.completed_requests:
@@ -879,7 +909,8 @@ class SyncLifecycle:
                 + hashlib.sha256(
                     b"".join(
                         (Path(__file__).parent / name).read_bytes()
-                        for name in ("agentrl.py", "agentrl_trace.py", "backends.py", "models.py")
+                        for name in ("agentrl.py", "agentrl_async.py", "agentrl_trace.py", "backends.py", "models.py")
+                        if (Path(__file__).parent / name).exists()
                     )
                 ).hexdigest(),
                 "observation_boundary": "host_file_api",
@@ -889,7 +920,7 @@ class SyncLifecycle:
                 provenance["calibration_sha256"] = self.config.request_profile["provenance"]["source_sha256"]
             normalized = {
                 "schema_version": 1,
-                "mode": "sync",
+                "mode": self.config.trainer_mode,
                 "provenance": provenance,
                 "requests": self.completed_requests,
                 "events": self.trace.events,
