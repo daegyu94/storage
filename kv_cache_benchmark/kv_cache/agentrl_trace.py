@@ -122,15 +122,23 @@ def validate_trace(trace):
     record_fields = ("rank", "prompt_tokens", "prefix_tokens", "prefix_id", "trajectory_bytes", "turns")
     for request in trace["requests"]:
         validate_record({k: request.get(k) for k in record_fields})
-        for name in ("iteration", "request", "policy_start", "policy_end", "prompt_policy", "trainer_policy_at_accept"):
+        for name in ("iteration", "request", "policy_start", "policy_end", "prompt_policy"):
             number(request.get(name), name, integer=True)
+        disposition = request.get("disposition", "accepted")
+        if disposition not in ("accepted", "queued", "dropped", "run_end"):
+            raise ValueError("invalid request disposition")
+        accepted = request.get("trainer_policy_at_accept")
+        if disposition == "accepted":
+            number(accepted, "trainer_policy_at_accept", integer=True)
+        elif accepted is not None:
+            raise ValueError("unconsumed request cannot have an acceptance policy")
         for name in ("start_s", "end_s"):
             number(request.get(name), name)
         if request["end_s"] < request["start_s"] or request["policy_end"] < request["policy_start"]:
             raise ValueError("request time/version reversed")
-        if request["trainer_policy_at_accept"] < request["prompt_policy"]:
+        if accepted is not None and accepted < request["prompt_policy"]:
             raise ValueError("prompt is from a future policy")
-        if request["trainer_policy_at_accept"] < request["policy_end"]:
+        if accepted is not None and accepted < request["policy_end"]:
             raise ValueError("generated tokens are from a future policy")
         identity = tuple(request[k] for k in ("rank", "iteration", "request"))
         if identity in seen:
@@ -212,9 +220,11 @@ def analyze_trace(trace):
         metrics["request_duration_s"].append(request["end_s"] - request["start_s"])
         metrics["decode_tokens_per_active_s"].append(tokens / active)
         metrics["tool_delay_s"].extend(t["tool_delay_s"] for t in turns[:-1])
-        metrics["prompt_age_steps"].append(request["trainer_policy_at_accept"] - request["prompt_policy"] + 1)
+        if request["trainer_policy_at_accept"] is not None:
+            metrics["prompt_age_steps"].append(request["trainer_policy_at_accept"] - request["prompt_policy"] + 1)
         metrics["generated_policy_span"].append(request["policy_end"] - request["policy_start"])
-        metrics["generated_policy_lag"].append(request["trainer_policy_at_accept"] - request["policy_end"])
+        if request["trainer_policy_at_accept"] is not None:
+            metrics["generated_policy_lag"].append(request["trainer_policy_at_accept"] - request["policy_end"])
     grouped = defaultdict(list)
     owner_events = defaultdict(list)
     ios = defaultdict(dict)

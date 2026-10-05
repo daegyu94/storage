@@ -44,6 +44,19 @@ def run(tmp_path, config=None, **kwargs):
     return runner, runner.run()
 
 
+def test_zero_payload_checkpoint_can_be_reopened_without_in_memory_metadata(tmp_path):
+    config = tiny(checkpoint_bytes_per_rank=0)
+    runner, _ = run(tmp_path, config)
+    manifest = runner.storage_dir / "checkpoints/step-1/manifest.json"
+    restored = SyncLifecycle(config, tmp_path / "restored", tmp_path / "results", resume=manifest)
+    assert restored.run()["final_policy_version"] == 2
+    assert any(
+        e["kind"] == "checkpoint" and e["op"] == "read" and e["bytes"] == 0
+        for e in restored.trace.events
+        if e["event"] == "io_end"
+    )
+
+
 @pytest.mark.parametrize(
     "field,value",
     [

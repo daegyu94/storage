@@ -27,6 +27,7 @@ from kv_cache.models import ModelConfig
 class AgentRLConfig:
     trainer_mode: str = "sync"
     request_profile: dict | None = None
+    async_workload: dict | None = None
     generation_rate_scope: str = "request"
     iterations: int = 2
     requests_per_rank: int = 4
@@ -80,14 +81,25 @@ class AgentRLConfig:
         return config
 
     def validate(self):
-        if self.trainer_mode != "sync":
-            raise ValueError("v0.1 supports trainer_mode=sync only")
+        if self.trainer_mode not in ("sync", "colocate_async", "separate_async"):
+            raise ValueError("unsupported trainer_mode")
+        if self.trainer_mode == "sync":
+            if self.async_workload is not None:
+                raise ValueError("async_workload requires an async trainer_mode")
+        else:
+            from kv_cache.agentrl_async import AsyncSettings
+
+            AsyncSettings.parse(self.async_workload, self.trainer_mode)
+            if self.generation_rate_scope != "owner":
+                raise ValueError("async execution requires generation_rate_scope=owner")
         if self.generation_rate_scope not in ("request", "owner"):
             raise ValueError("generation_rate_scope must be request or owner")
         if self.request_profile is not None:
             validate_profile(self.request_profile)
-            if self.request_profile["mode"] != "sync":
-                raise ValueError("only sync profiles are replayable; async profiles are analysis-only")
+            if self.request_profile["mode"] != self.trainer_mode:
+                raise ValueError(f"profile mode must match trainer_mode={self.trainer_mode}")
+            if self.trainer_mode != "sync" and any(r["rank"] != 0 for r in self.request_profile["records"]):
+                raise ValueError("local async supports rank-0 profiles only")
             if self.request_profile["provenance"].get("observation_boundary") != "host_file_api":
                 raise ValueError("profile requires host_file_api observation boundary")
         if self.network_mode not in ("none", "estimate"):
@@ -117,6 +129,10 @@ class AgentRLConfig:
             minimum = 1 if name in positive_ints else 0
             if type(value) is not int or value < minimum:
                 raise ValueError(f"{name} must be an integer >= {minimum}")
+        if self.trainer_mode != "sync" and self.request_profile:
+            AsyncSettings.parse(self.async_workload, self.trainer_mode).validate_profile_groups(
+                self.request_profile, self.requests_per_rank
+            )
         for name in (
             "tokens_per_second",
             "prefill_tokens_per_second",
@@ -227,6 +243,8 @@ class AgentRLConfig:
             values.pop("request_profile")  # Keep v0.1 checkpoint fingerprints compatible.
         if self.generation_rate_scope == "request":
             values.pop("generation_rate_scope")
+        if self.async_workload is None:
+            values.pop("async_workload")
         return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
@@ -268,6 +286,8 @@ class Trace:
 class SyncLifecycle:
     def __init__(self, config, storage_root, results_dir, *, comm=None, resume=None, backend_factory=NVMeBackend):
         config.validate()
+        if type(self) is SyncLifecycle and config.trainer_mode != "sync":
+            raise ValueError("use create_lifecycle for async trainer_mode")
         self.config = config
         self.comm = comm
         self.rank = comm.Get_rank() if comm else 0
@@ -339,10 +359,10 @@ class SyncLifecycle:
         return np.random.default_rng(seed).integers(0, 256, size=size, dtype=np.uint8)
 
     async def io(
-        self, backend, op, key, size=0, *, kind, request=None, policy=None, iteration=None, owner=None, role=None
+        self, backend, op, key, size=None, *, kind, request=None, policy=None, iteration=None, owner=None, role=None
     ):
-        if op == "read" and not size:
-            size = backend.metadata[key]["size"]
+        if size is None:
+            size = backend.metadata[key]["size"] if op == "read" else 0
         data = self.payload(key, size) if op == "write" else None
         identity = {
             "io_id": self.io_sequence,
@@ -937,3 +957,11 @@ class SyncLifecycle:
             "summary", lambda: self.write_json(self.result_dir / "summary.json", summary) if self.rank == 0 else None
         )
         return summary
+
+
+def create_lifecycle(config, storage_root, results_dir, **kwargs):
+    if config.trainer_mode == "sync":
+        return SyncLifecycle(config, storage_root, results_dir, **kwargs)
+    from kv_cache.agentrl_async import AsyncLifecycle
+
+    return AsyncLifecycle(config, storage_root, results_dir, **kwargs)

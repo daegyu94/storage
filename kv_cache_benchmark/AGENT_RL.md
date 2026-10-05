@@ -1,6 +1,6 @@
 # Experimental GPU-less Agent RL lifecycle
 
-`agent-rl.py` runs a finite synchronous rollout/training lifecycle using the existing `ModelConfig` and `NVMeBackend`.
+`agent-rl.py` runs finite sync or local async rollout/training lifecycles using the existing `ModelConfig` and `NVMeBackend`.
 Compute is replaced by delays; the workload performs real POSIX prompt, KV, trajectory and synthetic checkpoint I/O.
 This is an experimental extension, not an official MLPerf submission workload.
 
@@ -41,19 +41,20 @@ Multiple admitted requests overlap their compute delays and threaded I/O; a requ
 
 `AgentRLConfig` in `kv_cache/agentrl.py` is the canonical schema and rejects unknown fields.
 JSON and YAML configurations are supported; omitted fields use dataclass defaults recorded in `config.json`.
-Only `trainer_mode=sync` is implemented.
+`trainer_mode` accepts `sync`, `colocate_async` and `separate_async`.
+Sync supports MPI; async currently supports one process with explicit logical owners.
 
 | Fields | Meaning |
 | --- | --- |
 | `iterations`, `requests_per_rank`, `concurrency`, `seed` | Finite workload, request admission and deterministic profiles |
 | `model` | Existing `ModelConfig` constructor fields; default is a tiny synthetic model |
 | `prompt_tokens`, `response_tokens`, `chunk_tokens` | Initial context, deterministic length mixture and decode chunk size |
-| `tokens_per_second`, `prefill_tokens_per_second`, `rank_rate_factors` | Per-request rates; factors repeat over logical ranks |
+| `tokens_per_second`, `prefill_tokens_per_second`, `rank_rate_factors` | Configured rates; factors repeat over sync ranks or async logical rollout owners |
 | `kv_offload_fraction` | Fraction of newly created KV bytes written to storage, default 0 |
 | `prefix_reuse_probability`, `hot_prefixes`, `prefix_skew` | Requests choose a hot catalog or unique cold prefix; actual hits depend on policy/owner key existence |
 | `turns`, `tool_delay_s`, `observation_tokens` | Multi-turn timing pause and history growth; no sandbox files |
 | `persist_trajectories` | Synthetic payload save and training input read; set false for an in-memory queue, default true |
-| `train_delay_s` | Training compute delay on the same logical pool |
+| `train_delay_s` | Compute delay per global update, split over separated mini-batches |
 | `checkpoint_every`, `checkpoint_bytes_per_rank` | Save cadence and synthetic state bytes; every=0 disables saves |
 | `weight_sync_delay_s`, `weight_bytes` | Base transfer delay and optional NIC estimate; no real weight traffic |
 | `network_mode` | `none` uses actual backend latency; `estimate` adds modeled transport sleep |
@@ -122,6 +123,60 @@ Queue wait includes admission delay from that common offered time.
 Summary fields include compute queue wait, modeled decode service and achieved generated tokens divided by rollout phase wall time.
 Summed compute wait across requests is not elapsed time.
 
+## Local asynchronous workload
+
+Add the following to the small configuration above and use the same entry point:
+
+```yaml
+trainer_mode: separate_async   # or colocate_async
+generation_rate_scope: owner
+async_workload:
+  group_size: 2
+  batch_groups: 1
+  outstanding_groups: 4
+  queue_capacity: 2
+  rollout_owners: 2
+  parameter_sync_step: 2       # must be 1 for colocate_async
+  max_prompt_age: null
+  staleness_strategy: drop     # or wait
+  kv_gc_delay_s: 0.01
+```
+
+`iterations` counts global policy transitions, not fixed rollout batches.
+Each prompt group has `group_size` siblings sharing one prompt file and owner, with individual configured response/turn budgets.
+Only groups whose siblings all finish can be sampled; `batch_groups` is the number of groups per trainer mini-batch.
+`outstanding_groups` bounds dispatch credits and `queue_capacity` bounds terminal groups waiting for the trainer.
+Both must be at least `batch_groups`; selected/dropped groups release one dispatch credit each.
+`concurrency` separately bounds executing requests, not the entire set of queued sibling tasks.
+This constant-window refill is a bounded approximation of veRL prompt refill, not an exact replay of its dispatch distribution.
+
+Colocated mode pauses engine sections after sampling and retires old KV before training.
+Standalone separated mode allows generation, KV writes and trajectory production during trajectory consumption, training and checkpoint writes.
+After `parameter_sync_step` mini-batches it pauses rollout for weight synchronization and installs the next policy.
+Modeled weight-sync latency influences I/O timing without transferring real weights.
+The implementation does not reproduce veRL hybrid idle-pool lending.
+
+Pauses drain the current token chunk and related KV I/O, retaining generated tokens and the original remaining budget.
+On a new policy, unfinished requests re-prefill their retained prompt/generated/observation history before decoding resumes.
+CPU tool delays can continue while generation is paused; they still produce no sandbox filesystem traffic.
+Policy retirement makes old keys inaccessible immediately; `kv_gc_delay_s` delays physical delete of a frozen key snapshot.
+New policy keys remain independent of old GC, and run shutdown drains file operations before cleanup and reporting.
+Physical KV peak includes retired bytes until GC; no finite cache capacity or eviction policy is modeled.
+
+Prompt age is `trainer_policy - prompt_policy + 1`.
+With `drop`, only terminal groups with age **greater than** the threshold are discarded.
+With `wait`, sampling waits for running groups whose age is **at least** the threshold.
+Null disables this bound; generated policy span remains a separate observation.
+Unconsumed completed requests have disposition `queued`, `dropped` or `run_end` and a null `trainer_policy_at_accept`.
+Accepted requests have disposition `accepted` and the policy at actual sampling.
+
+Every rollout owner has a real KV/trajectory namespace on the same filesystem; trainer and GC I/O have explicit role tags.
+Owner count is a synthetic compute/storage concurrency parameter, not measured physical node or GPU count.
+Async multi-rank launch is rejected before I/O because a distributed role/queue/version/failure protocol has not been implemented.
+Sync MPI behavior is preserved.
+Async checkpoints contain real shard/manifest I/O but mark `inflight_recoverable: false`; async `--resume` is rejected.
+Source hashes, effective settings, queue/window peaks and completion dispositions support reproduction while fidelity remains `uncalibrated`.
+
 ## Joint request calibration and reference comparison
 
 `agent-rl.py --profile profile.json` accepts a joint request profile generated by:
@@ -155,7 +210,11 @@ Runs export `trace-rank-N.json` alongside the original event arrays.
 They contain observed request active times, event boundaries and a source-code hash, with fidelity still `uncalibrated`.
 The comparison reports per-rank arrival gaps, request/tool/rate/byte distributions, operation totals, phase lags, prompt age and generated policy span separately.
 It checks I/O pairing, tool pauses, sync completion ordering and same-rank compute overlap across iteration boundaries.
-The `colocate_async` and `separate_async` modes are accepted for reference analysis only; the runner rejects async replay profiles.
+The local async runner accepts mode-matched rank-0 profiles with complete contiguous groups of `group_size` records sharing prompt/prefix shape.
+`requests_per_rank` must also be a multiple of `group_size` for profile replay; sibling turn/trajectory fields remain joint and unchanged.
+Record ordering supplies synthetic group assignment; real enqueue timestamps, dispatch groups and arrival correlations are not replayed.
+An exported run ending with only some siblings complete may require an explicit group-aware calibration selection before conversion.
+The generic converter does not silently invent missing siblings or filter discarded samples.
 For colocated overlap checks, producers must use a common owner observation clock; unaligned process clocks cannot be relabeled as one rank.
 No cross-rank concurrency is inferred.
 
