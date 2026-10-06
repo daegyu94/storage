@@ -1213,6 +1213,10 @@ class SyncLifecycle:
                 if settings.fs_execution == "background"
                 else "caller_awaits_completion",
                 "promotion_admission": settings.promotion_admission,
+                "primary_completion_model": "declared_repeating_host_poll_schedule"
+                if settings.fs_completion_processing == "polled"
+                else "task_completion",
+                "completion_cadence_calibrated": False,
                 "fidelity": "uncalibrated",
             }
         return result

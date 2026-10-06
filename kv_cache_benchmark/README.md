@@ -145,3 +145,30 @@ Repeated retirements in one policy may describe the same physical key, so event 
 These are file-length observations, not device allocation, host RSS, DMA or network traffic.
 CPU capacity remains a metadata reservation budget; persistent FS metadata grows with the number of files.
 Retained files require explicit cleanup by the experiment owner and are not automatically reused across runs.
+
+### Optional primary completion polling
+
+Background FS service completion and primary-slot availability can be modeled separately:
+
+```yaml
+kv_offload_tiers:
+  cpu_capacity_bytes: 2359296  # Choose from the configured model/block/TP geometry.
+  fs_execution: background
+  fs_completion_processing: polled
+  fs_completion_poll_intervals_s: [0.004, 0.008]  # Declared synthetic host intervals.
+```
+
+`task` remains the default and requires poll intervals to be absent/null.
+`polled` requires enabled FS and a nonempty list of positive finite intervals.
+The list repeats while this owner has admitted work; it is not derived from a GPU name or certified as a vLLM engine cadence.
+Service releases the FS worker immediately, while CPU pins and promotion readiness wait for a poll.
+Polling continues during idle/tool pauses; a boundary drain waits for real service, forces application and closes the poll task.
+New admissions are rejected during that forced drain.
+A store cancelled before its coroutine starts still retires its reservation; failed promotion waiters receive the failure without issuing another read.
+
+`fs_primary_completion_ready`, `fs_completion_poll_begin/end` and `fs_primary_completion_apply` link service return, host poll and slot application by owner/key/completion ID.
+`fs_completion_pending` counts admitted operations awaiting application, including active service; completed records remain bounded by CPU slots.
+Poll counts, empty/reset polls, queue peaks and service-to-primary lag are reported in each tier summary.
+`io_actual_end` remains the measured backend boundary; completion readiness follows the modeled I/O return, which can also include configured network delay.
+The periodic/repeating schedule, its initial phase and native GPU/DMA timing remain uncalibrated.
+This follows the v0.29 completion boundary, without implementing latest-main latency-based secondary backpressure detectors.

@@ -192,7 +192,7 @@ def test_trace_detects_changed_storage_context_between_arrival_and_completion(tm
 
 @pytest.mark.parametrize("background", [False, True])
 @pytest.mark.parametrize("target", ["worker_kv", "worker_gc", "trainer_checkpoint", "trainer_trajectory", "unshared"])
-def test_mpi_role_failure_never_hangs_or_publishes_complete_summary(tmp_path, target, background):
+def test_mpi_role_failure_never_hangs_or_publishes_complete_summary(tmp_path, target, background, completion="task"):
     if not shutil.which("mpiexec"):
         pytest.skip("mpiexec unavailable")
     pytest.importorskip("mpi4py")
@@ -202,6 +202,8 @@ def test_mpi_role_failure_never_hangs_or_publishes_complete_summary(tmp_path, ta
         from test_agentrl_tiering import config as tiered
 
         raw = asdict(tiered("separate_async", fs_execution="background", fs_write_workers=1))
+        if completion == "polled":
+            raw["kv_offload_tiers"].update(fs_completion_processing="polled", fs_completion_poll_intervals_s=[0.01])
         raw["async_workload"].update(execution="mpi_shared", rollout_owners=2)
     config_path.write_text(json.dumps(raw))
     helper = tmp_path / "role_failure.py"

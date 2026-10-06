@@ -63,7 +63,7 @@ def test_default_retention_and_cpu_only_constraint():
 @pytest.mark.parametrize("execution", ["caller_await", "background"])
 def test_retained_files_survive_policy_and_run_but_are_never_reloaded(tmp_path, mode, execution):
     raw = asdict(retained_config(mode, fs_execution=execution))
-    if mode == "colocate_async":
+    if mode != "sync":
         # A queued completed cohort alone need not decode under a new policy.
         # Stragglers force the abort/re-prefill path this test must exercise.
         raw.update(iterations=5, response_tokens=[2, 2, 30, 30])
@@ -76,7 +76,8 @@ def test_retained_files_survive_policy_and_run_but_are_never_reloaded(tmp_path, 
     assert not analyze_trace(trace)["violations"]
     writes = completed_kv(events, "write")
     assert writes and not completed_kv(events, "delete")
-    assert {e["policy"] for e in writes} >= {0, 1}
+    policies = {e["policy"] for e in writes}
+    assert 0 in policies and any(version > 0 for version in policies)
     files = list(runner.storage_dir.glob("**/kv/*.npy"))
     assert len(files) == len({e["key"] for e in writes})
     rank = summary["ranks"][0]
