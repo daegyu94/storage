@@ -722,3 +722,184 @@ def test_background_sync_checkpoint_recovery_and_corruption(tmp_path):
     (manifest.parent / metadata["shards"][0]["path"]).write_bytes(b"broken")
     with pytest.raises(RuntimeError, match="checkpoint|checksum"):
         execute(tmp_path / "corrupt", settings, resume=manifest)
+
+
+def test_background_fs_hit_refuses_pinned_cpu_then_retries_after_drain(tmp_path):
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def hold(op, key):
+            if op == "write" and key == "b":
+                started.set()
+                await release.wait()
+
+        cpu, backend, operations, events = tier(tmp_path, background=True, hold=hold)
+        await cpu.store("a")
+        await cpu.drain()
+        await cpu.store("b")
+        await started.wait()
+        try:
+            assert await cpu.load("b") and operations == [("write", "a", 32)]
+            assert await asyncio.wait_for(cpu.load("a", request=0, policy=0), 0.1) is False
+            assert backend._get_path("a").is_file() and "a" in cpu.fs_keys
+            assert list(cpu.entries) == ["b"] and cpu.entries["b"].pins == 1
+            assert operations == [("write", "a", 32)]
+            assert cpu.summary()["cpu_promotion_attempts"] == cpu.summary()["cpu_promotion_refusals"] == 1
+            assert cpu.summary()["cpu_wait_events"] == 0
+            assert next(e for e in events if e["event"] == "cpu_promote_reject")["request"] == 0
+        finally:
+            release.set()
+            await cpu.drain()
+        assert await cpu.load("a")
+        assert operations[-1] == ("read", "a", 32)
+        assert cpu.summary()["cpu_promotion_attempts"] == 2 and cpu.summary()["cpu_promotion_refusals"] == 1
+        assert cpu.summary()["cpu_pinned_pages"] == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("background", [False, True])
+@pytest.mark.parametrize("outcome", ["cancel", "failure"])
+def test_promotion_read_cancel_and_failure_preserve_transfer_and_pin_lifetime(tmp_path, background, outcome):
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def hold(op, key):
+            if op == "read":
+                started.set()
+                await release.wait()
+
+        cpu, _, operations, _ = tier(
+            tmp_path, background=background, hold=hold, fail="read" if outcome == "failure" else None
+        )
+        await cpu.store("a")
+        await cpu.drain()
+        await cpu.store("b")
+        await cpu.drain()
+        task = asyncio.create_task(cpu.load("a"))
+        await started.wait()
+        if outcome == "cancel":
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+        assert cpu.summary()["cpu_pinned_pages"] == 1
+        release.set()
+        with pytest.raises(asyncio.CancelledError if outcome == "cancel" else OSError):
+            await task
+        stats = cpu.summary()
+        assert stats["cpu_pinned_pages"] == stats["cpu_promotion_refusals"] == 0
+        assert stats["cpu_promotion_attempts"] == 1
+        if outcome == "cancel":
+            assert operations[-1] == ("read", "a", 32) and stats["fs_read_ops"] == 1
+            assert cpu.entries["a"].ready and await cpu.load("a")
+        else:
+            assert "a" not in cpu.entries and stats["fs_read_ops"] == 0
+            assert all(op == "write" for op, _, _ in operations)
+
+    asyncio.run(scenario())
+
+
+def test_caller_await_fs_hit_still_waits_for_pinned_cpu(tmp_path):
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def hold(op, key):
+            if op == "write" and key == "b":
+                started.set()
+                await release.wait()
+
+        cpu, _, operations, _ = tier(tmp_path, hold=hold)
+        await cpu.store("a")
+        store = asyncio.create_task(cpu.store("b"))
+        await started.wait()
+        load = asyncio.create_task(cpu.load("a"))
+        try:
+            await asyncio.sleep(0)
+            assert not load.done() and operations == [("write", "a", 32)]
+        finally:
+            release.set()
+            await store
+        assert await load
+        assert cpu.summary()["cpu_wait_events"] == 1 and cpu.summary()["cpu_promotion_refusals"] == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("background", [False, True])
+def test_promotion_pending_same_key_shares_one_read(tmp_path, background):
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def hold(op, key):
+            if op == "read":
+                started.set()
+                await release.wait()
+
+        cpu, _, operations, _ = tier(tmp_path, background=background, hold=hold)
+        await cpu.store("a")
+        await cpu.drain()
+        await cpu.store("b")
+        await cpu.drain()
+        first = asyncio.create_task(cpu.load("a"))
+        await started.wait()
+        second = asyncio.create_task(cpu.load("a"))
+        try:
+            await asyncio.sleep(0)
+            assert not second.done() and cpu.summary()["cpu_pinned_pages"] == 1
+        finally:
+            release.set()
+        assert await first and await second
+        assert operations.count(("read", "a", 32)) == 1
+        assert cpu.summary()["cpu_promotion_attempts"] == 1 and cpu.summary()["cpu_promotion_refusals"] == 0
+        assert cpu.summary()["cpu_pinned_pages"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_background_promotion_refusal_uses_existing_kv_recompute(tmp_path):
+    from kv_cache.agentrl_kv import CacheSettings, KVPool
+
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+        first_key = "v0-o0-r0-block-0"
+        second_key = "v0-o0-r1-block-0"
+
+        async def hold(op, key):
+            if op == "write" and key == second_key:
+                started.set()
+                await release.wait()
+
+        cpu, _, operations, events = tier(tmp_path, background=True, hold=hold)
+        recomputed = []
+
+        async def recompute(key, size, **context):
+            recomputed.append((key, size, context))
+
+        pool = KVPool(CacheSettings(32, 16), 2, 0, cpu.io, cpu.emit, tiers=cpu, recompute=recompute)
+        for request in (0, 1):
+            async with pool.lease(0, request, None, 0, 16, 0, iteration=0) as lease:
+                pool.materialize(lease, 16)
+                await pool.publish(lease, 16, prompt_tokens=16)
+            if request == 0:
+                await cpu.drain()
+        await started.wait()
+
+        async def reload():
+            async with pool.lease(0, 0, None, 0, 16, 0, iteration=0):
+                assert recomputed == [(first_key, 32, {"request": 0, "policy": 0, "iteration": 0})]
+                assert pool.entries[first_key].resident
+
+        reload_task = asyncio.create_task(reload())
+        try:
+            done, _ = await asyncio.wait([reload_task], timeout=0.1)
+            assert reload_task in done
+            await reload_task
+            assert all(op == "write" for op, _, _ in operations)
+            assert any(e["event"] == "cpu_promote_reject" and e["key"] == first_key for e in events)
+        finally:
+            release.set()
+            await cpu.drain()
+            await asyncio.gather(reload_task, return_exceptions=True)
+        assert pool.summary()["pinned_blocks"] == cpu.summary()["cpu_pinned_pages"] == 0
+
+    asyncio.run(scenario())

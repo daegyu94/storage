@@ -497,13 +497,20 @@ Completed new-store batches are admitted atomically while protecting their reuse
 Rejected batches leave the publication cursor unchanged and are retried at later synthetic publish boundaries.
 Skipped-store counters count rejected block-attempts, including retries, rather than unique lost blocks.
 Backlog is bounded by CPU page count, and a CPU hit may serve a block while its FS write is pending.
-Missing copies follow the existing cache miss/re-prefill path; reads/promotions still await storage.
+Missing copies follow the existing cache miss/re-prefill path.
+Admitted promotions and an existing pending read still await storage completion.
+For a new FS-valid promotion, background mode refuses allocation when all CPU slots are pinned and follows the existing recompute path instead of waiting indefinitely.
+The FS copy remains valid, so a later lookup can retry after pins are released.
+CPU-ready hits continue to avoid FS reads even while their cascade is pending.
 
 Sync drains at rollout end; colocated async drains after pausing for training; separated async allows writes to overlap training/checkpoint and drains before policy installation.
 All modes drain on cleanup before invalidating old-policy metadata and doing physical GC.
 Failed writes cannot become valid FS hits, and background errors propagate through local or MPI failure handling.
 Trace events include `cpu_store_skip`, `fs_store_submit/begin/end` and `offload_drain_begin/end`.
 Owner summaries expose skipped payloads, pending/active peaks, executor wait and failed-store counts.
+`cpu_promotion_attempts` counts FS-valid CPU-miss allocations; `cpu_promotion_refusals` counts allocations refused before any read.
+`promotion_admission` is `refuse_pinned_capacity` in background mode and `await_slot` in the default path.
+The `cpu_promote_reject` event preserves key/request/policy context; these counters are attempts, not unique lost KV or actual transferred bytes.
 
 This admission/pinning model follows the vLLM v0.29 CPU manager contract but does not reproduce DMA, scheduler-step timing, native priority pools or newer latency-based proportional throttling.
 Policy invalidation and physical GC remain conservative: native secondary FS retention/cache namespaces require further trace validation.

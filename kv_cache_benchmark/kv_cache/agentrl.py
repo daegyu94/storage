@@ -1175,6 +1175,7 @@ class SyncLifecycle:
                 "transfer_pipeline": "background_cpu_pinned"
                 if settings.fs_execution == "background"
                 else "caller_awaits_completion",
+                "promotion_admission": settings.promotion_admission,
                 "fidelity": "uncalibrated",
             }
         return result

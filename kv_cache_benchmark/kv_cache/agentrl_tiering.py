@@ -2,7 +2,7 @@
 
 CPU reservation is metadata only. This does not emulate DMA or vLLM's
 scheduler-step transfer pipeline. Background cascade is an opt-in model;
-CPU slots remain pinned and full staging skips new stores without blocking.
+CPU slots remain pinned; full staging refuses new stores and promotions.
 """
 
 import asyncio
@@ -19,6 +19,10 @@ class TierSettings:
     offload_prompt_only: bool = True
     fs_execution: str = "caller_await"
     fs_write_workers: int = 16
+
+    @property
+    def promotion_admission(self):
+        return "refuse_pinned_capacity" if self.fs_execution == "background" else "await_slot"
 
     @classmethod
     def parse(cls, values):
@@ -73,8 +77,9 @@ class CPUPrimary:
         self.store_skipped = self.failed_stores = 0
         self.queue_wait_s = 0.0
         self.store_sequence = 0
+        self.promotion_attempts = self.promotion_refusals = 0
 
-    async def reserve(self, key, *, ready, context):
+    async def reserve(self, key, *, ready, context, wait=True):
         async with self.condition:
             waiting = False
             while True:
@@ -94,6 +99,8 @@ class CPUPrimary:
                         self.evictions += 1
                         self.emit("cpu_cache_evict", key=victim, bytes=self.page_bytes, **context)
                         continue
+                    if not wait:
+                        return None, False
                 if not waiting:
                     self.waits += 1
                     waiting = True
@@ -259,7 +266,14 @@ class CPUPrimary:
             if key not in self.fs_keys:
                 self.emit("fs_cache_miss", key=key, **context)
                 return False
-        entry, created = await self.reserve(key, ready=False, context=context)
+        self.promotion_attempts += 1
+        entry, created = await self.reserve(
+            key, ready=False, context=context, wait=self.settings.fs_execution == "caller_await"
+        )
+        if entry is None:
+            self.promotion_refusals += 1
+            self.emit("cpu_promote_reject", key=key, bytes=self.page_bytes, reason="pinned_capacity", **context)
+            return False
         if not created:
             self.hits += 1
             return True
@@ -299,6 +313,9 @@ class CPUPrimary:
             "cpu_misses": self.misses,
             "cpu_evictions": self.evictions,
             "cpu_promotions": self.promotions,
+            "cpu_promotion_attempts": self.promotion_attempts,
+            "cpu_promotion_refusals": self.promotion_refusals,
+            "promotion_admission": self.settings.promotion_admission,
             "cpu_store_ops": self.stores,
             "cpu_wait_events": self.waits,
             "cpu_store_skipped": self.store_skipped,
