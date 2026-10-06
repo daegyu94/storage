@@ -435,3 +435,42 @@ Summary and normalized trace report worker/unique/aggregate geometry, GPU budget
 Native vLLM CPU-only offload does not imply filesystem KV I/O.
 Its filesystem secondary tier, completed-block/prompt eligibility and CPU staging differ from this extension's fractional or chunk-safe dirty-eviction model.
 Specifying reference geometry does not certify native connector fidelity.
+
+## Bounded CPU primary and unbounded FS secondary
+
+Opt in with `kv_offload_tiers` alongside reference geometry and `kv_cache_model`:
+
+```yaml
+kv_offload_tiers:
+  cpu_capacity_bytes: 2359296
+  fs_enabled: true
+  fs_capacity_bytes: null
+  offload_prompt_only: true
+```
+
+The CPU budget covers aggregate TP payload per rollout owner/replica, unlike the per-GPU KV budget.
+It must fit one complete block and is rounded down to whole staging pages.
+CPU residency is metadata only, not allocated host RAM or measured RSS.
+Completed eligible blocks enter CPU and cascade immediately to actual FS writes, including when GPU capacity is sufficient.
+CPU eviction does not trigger cascade; CPU hits avoid FS reads and misses promote valid FS copies through pinned CPU pages.
+Transfers cannot evict pinned staging pages; cancellation drains actual I/O before releasing pins.
+
+Prompt-only is the default.
+Incomplete tails and generated blocks outside prompt eligibility have no offloaded copy and use configured prefill recompute when GPU-like residency is lost.
+A per-generation-call store cursor prevents recopying the same prompt every decode step.
+Tool observations and policy re-prefill start a new longer prompt call.
+Setting `offload_prompt_only: false` also stores completed generated blocks.
+CPU-only (`fs_enabled: false`) produces zero KV filesystem reads/writes.
+Absent tier settings preserve the existing dirty-eviction behavior and fingerprints.
+
+FS has no logical capacity eviction; actual ENOSPC and I/O errors fail the run.
+Request completion releases GPU working sets, retaining CPU/FS copies until policy invalidation.
+Logical invalidation removes lookup eligibility before existing physical GC.
+Summary owner `offload_tiers` reports CPU reserved/peak bytes, hits/misses, stores/promotions/evictions/waits and successful FS transfer totals.
+Legacy cache `offload_ops/reload_ops` count only the dirty-eviction path; use tier counters or `io_totals.kv_*` for this model.
+FS valid bytes exclude retired copies pending GC; existing physical KV metrics track those files.
+
+Normalized traces include resolved `kv_offload_tiers` and `tier: fs` on actual KV I/O.
+Callers await FS completion while other requests can overlap compute/I/O.
+Native vLLM asynchronous scheduler-step DMA/cascade, per-TP files, padded layouts and connector reset behavior remain uncalibrated.
+This extension does not start Ray/vLLM or certify native fidelity.

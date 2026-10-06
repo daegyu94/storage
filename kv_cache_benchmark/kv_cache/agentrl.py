@@ -32,6 +32,7 @@ class AgentRLConfig:
     async_workload: dict | None = None
     kv_cache_model: dict | None = None
     rollout_reference: dict | None = None
+    kv_offload_tiers: dict | None = None
     generation_rate_scope: str = "request"
     iterations: int = 2
     requests_per_rank: int = 4
@@ -272,6 +273,10 @@ class AgentRLConfig:
             from kv_cache.agentrl_kv import CacheSettings
 
             CacheSettings.parse(self.kv_cache_model).validate(self)
+        if self.kv_offload_tiers is not None:
+            from kv_cache.agentrl_tiering import TierSettings
+
+            TierSettings.parse(self.kv_offload_tiers).validate(self)
 
     @property
     def bytes_per_token(self):
@@ -303,6 +308,8 @@ class AgentRLConfig:
             values.pop("kv_cache_model")
         if self.rollout_reference is None:
             values.pop("rollout_reference")
+        if self.kv_offload_tiers is None:
+            values.pop("kv_offload_tiers")
         return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
@@ -438,9 +445,26 @@ class SyncLifecycle:
                 name, owner=f"rollout-{owner}", policy=self.version, **{k: v for k, v in data.items() if k != "policy"}
             )
 
-        return KVPool(
-            CacheSettings.parse(self.config.kv_cache_model), self.config.bytes_per_token, owner, transfer, emit
-        )
+        settings = CacheSettings.parse(self.config.kv_cache_model)
+        tiers = None
+        if self.config.kv_offload_tiers is not None:
+            from kv_cache.agentrl_tiering import CPUPrimary, TierSettings
+
+            tiers = CPUPrimary(
+                TierSettings.parse(self.config.kv_offload_tiers),
+                settings.block_tokens * self.config.bytes_per_token,
+                transfer,
+                emit,
+            )
+
+        async def recompute(key, size, **context):
+            factor = self.config.rank_rate_factors[owner % len(self.config.rank_rate_factors)]
+            tokens = size // self.config.bytes_per_token
+            emit("gpu_recompute_begin", key=key, tokens=tokens, **context)
+            await asyncio.sleep(tokens / (self.config.prefill_tokens_per_second * factor))
+            emit("gpu_recompute_end", key=key, tokens=tokens, **context)
+
+        return KVPool(settings, self.config.bytes_per_token, owner, transfer, emit, tiers=tiers, recompute=recompute)
 
     def cached_event(self, name, state, **data):
         context = {
@@ -482,6 +506,9 @@ class SyncLifecycle:
                 await asyncio.sleep(suffix / (self.config.prefill_tokens_per_second * factor))
             pool.materialize(lease, state.history)
         state.kv_version = self.version
+        if pool.tiers is not None:
+            state.offload_prompt_tokens = state.history
+            await pool.publish(lease, state.history, prompt_tokens=state.history)
 
     async def cached_step(self, state, tokens, compute=None):
         pool = self.cache_pools[state.owner]
@@ -498,6 +525,10 @@ class SyncLifecycle:
             await self.cached_prepare(state, pool, lease)
             result = await compute() if compute else None
             pool.materialize(lease, previous + tokens)
+            if pool.tiers is not None:
+                if compute is None:
+                    state.offload_prompt_tokens = previous + tokens
+                await pool.publish(lease, previous + tokens, prompt_tokens=state.offload_prompt_tokens)
             return result
 
     async def retire_cache_request(self, state):
@@ -523,7 +554,19 @@ class SyncLifecycle:
         pass
 
     async def io(
-        self, backend, op, key, size=None, *, kind, request=None, policy=None, iteration=None, owner=None, role=None
+        self,
+        backend,
+        op,
+        key,
+        size=None,
+        *,
+        kind,
+        request=None,
+        policy=None,
+        iteration=None,
+        owner=None,
+        role=None,
+        tier=None,
     ):
         if size is None:
             size = backend.metadata[key]["size"] if op == "read" else 0
@@ -539,6 +582,7 @@ class SyncLifecycle:
             "owner": owner,
             "role": role,
             **self.io_context(),
+            **({"tier": tier} if tier is not None else {}),
         }
         self.io_sequence += 1
         self.io_active += 1
@@ -1086,7 +1130,18 @@ class SyncLifecycle:
         return {}
 
     def reference_fields(self):
-        return {"rollout_reference": self.config.reference_summary} if self.config.rollout_reference else {}
+        result = {"rollout_reference": self.config.reference_summary} if self.config.rollout_reference else {}
+        if self.config.kv_offload_tiers is not None:
+            from kv_cache.agentrl_tiering import TierSettings
+
+            result["kv_offload_tiers"] = {
+                "settings": asdict(TierSettings.parse(self.config.kv_offload_tiers)),
+                "store_trigger": "completed_block_cpu_cascade",
+                "cpu_residency_model": "metadata_only",
+                "transfer_pipeline": "caller_awaits_completion",
+                "fidelity": "uncalibrated",
+            }
+        return result
 
     def normalized_trace_fields(self):
         if self.config.kv_cache_model is None:
@@ -1156,6 +1211,7 @@ class SyncLifecycle:
                             "agentrl_mpi.py",
                             "agentrl_kv.py",
                             "agentrl_reference.py",
+                            "agentrl_tiering.py",
                             "agentrl_trace.py",
                             "backends.py",
                             "models.py",

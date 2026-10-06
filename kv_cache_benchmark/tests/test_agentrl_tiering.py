@@ -1,0 +1,413 @@
+"""CPU primary staging and unbounded filesystem secondary contracts."""
+
+import asyncio
+import json
+from dataclasses import asdict
+
+import numpy as np
+import pytest
+from test_agentrl import tiny
+from test_agentrl_cli import invoke
+from test_agentrl_kv_lifecycle import configured, execute
+from test_agentrl_reference import reference
+
+from kv_cache.agentrl import AgentRLConfig
+from kv_cache.backends import NVMeBackend
+
+
+def tier(tmp_path, *, pages=1, fs=True, hold=None, fail=None):
+    from kv_cache.agentrl_tiering import CPUPrimary, TierSettings
+
+    backend = NVMeBackend(str(tmp_path))
+    operations, events = [], []
+
+    async def io(op, key, size, **context):
+        if hold:
+            await hold(op, key)
+        if op == fail:
+            raise OSError("injected secondary failure")
+        if op == "write":
+            backend.write(key, np.arange(size, dtype=np.uint8))
+        else:
+            data, _ = backend.read(key)
+            assert data.nbytes == size
+        operations.append((op, key, size))
+
+    settings = TierSettings.parse({"cpu_capacity_bytes": pages * 32, "fs_enabled": fs})
+    cpu = CPUPrimary(settings, 32, io, lambda name, **data: events.append({"event": name, **data}))
+    return cpu, backend, operations, events
+
+
+def test_completed_store_cascades_before_cpu_eviction_and_cpu_hit_avoids_fs(tmp_path):
+    cpu, _, io, _ = tier(tmp_path)
+
+    async def scenario():
+        await cpu.store("a")
+        assert io == [("write", "a", 32)]
+        assert await cpu.load("a")
+        assert io == [("write", "a", 32)]
+        assert cpu.summary()["cpu_hits"] == 1
+
+    asyncio.run(scenario())
+
+
+def test_cpu_miss_promotes_from_fs_and_eviction_keeps_unbounded_secondary(tmp_path):
+    cpu, _, io, _ = tier(tmp_path)
+
+    async def scenario():
+        for key in ("a", "b", "c"):
+            await cpu.store(key)
+        assert await cpu.load("a")
+        assert io == [("write", k, 32) for k in ("a", "b", "c")] + [("read", "a", 32)]
+        stats = cpu.summary()
+        assert stats["cpu_reserved_bytes"] == stats["cpu_peak_bytes"] == 32
+        assert stats["fs_valid_payload_bytes"] == 96
+        assert not stats["fs_capacity_bounded"] and stats["fs_capacity_evictions"] == 0
+        assert stats["cpu_promotions"] == 1
+
+    asyncio.run(scenario())
+
+
+def test_cpu_only_has_no_filesystem_io_and_missing_copy_returns_miss(tmp_path):
+    cpu, _, io, _ = tier(tmp_path, fs=False)
+
+    async def scenario():
+        await cpu.store("a")
+        await cpu.store("b")
+        assert not await cpu.load("a")
+        assert await cpu.load("b")
+        assert io == []
+        assert cpu.summary()["fs_valid_payload_bytes"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_small_cpu_changes_reads_but_completed_store_volume_is_write_through(tmp_path):
+    async def scenario(pages):
+        cpu, _, io, _ = tier(tmp_path / str(pages), pages=pages)
+        for key in ("a", "b"):
+            await cpu.store(key)
+        for key in ("a", "b"):
+            assert await cpu.load(key)
+        return io
+
+    small, large = asyncio.run(scenario(1)), asyncio.run(scenario(2))
+    assert sum(op == "write" for op, _, _ in small) == sum(op == "write" for op, _, _ in large) == 2
+    assert sum(op == "read" for op, _, _ in small) == 2
+    assert sum(op == "read" for op, _, _ in large) == 0
+
+
+def test_cpu_pin_stalls_new_store_until_secondary_finishes(tmp_path):
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def hold(op, key):
+            if op == "write" and key == "a":
+                started.set()
+                await release.wait()
+
+        cpu, _, io, _ = tier(tmp_path, hold=hold)
+        a = asyncio.create_task(cpu.store("a"))
+        await started.wait()
+        b = asyncio.create_task(cpu.store("b"))
+        await asyncio.sleep(0.005)
+        assert not b.done() and cpu.summary()["cpu_pinned_pages"] == 1
+        assert cpu.summary()["cpu_reserved_bytes"] == 32 and not io
+        release.set()
+        await asyncio.wait_for(asyncio.gather(a, b), 1)
+        assert cpu.summary()["cpu_wait_events"] > 0
+        assert cpu.summary()["cpu_pinned_pages"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_duplicate_store_and_promotion_share_one_transfer(tmp_path):
+    async def scenario():
+        cpu, _, io, _ = tier(tmp_path)
+        await asyncio.gather(cpu.store("a"), cpu.store("a"))
+        await cpu.store("b")
+        await asyncio.gather(cpu.load("a"), cpu.load("a"))
+        assert io.count(("write", "a", 32)) == io.count(("read", "a", 32)) == 1
+
+    asyncio.run(scenario())
+
+
+def test_policy_invalidation_forbids_old_fs_lookup_before_physical_gc(tmp_path):
+    cpu, backend, io, _ = tier(tmp_path)
+
+    async def scenario():
+        await cpu.store("v0-a")
+        cpu.invalidate()
+        assert backend._get_path("v0-a").exists()
+        assert not await cpu.load("v0-a")
+        assert io == [("write", "v0-a", 32)]
+        assert cpu.summary()["cpu_reserved_bytes"] == cpu.summary()["fs_valid_payload_bytes"] == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("op", ["write", "read"])
+def test_secondary_failure_releases_cpu_pins_and_does_not_promote_false_data(tmp_path, op):
+    async def scenario():
+        cpu, _, _, _ = tier(tmp_path, fail="write" if op == "write" else None)
+        if op == "read":
+            await cpu.store("a")
+            await cpu.store("b")
+
+            async def broken(*args, **kwargs):
+                raise OSError("injected secondary failure")
+
+            cpu.io = broken
+        with pytest.raises(OSError, match="secondary"):
+            await (cpu.store("a") if op == "write" else cpu.load("a"))
+        assert cpu.summary()["cpu_pinned_pages"] == 0
+        if op == "read":
+            assert "a" not in cpu.entries
+            with pytest.raises(OSError, match="secondary"):
+                await cpu.load("a")
+            assert cpu.summary()["cpu_promotions"] == 0
+        else:
+            assert "a" not in cpu.fs_keys
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_cascade_drains_io_before_unpinning_cpu(tmp_path):
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def hold(op, key):
+            started.set()
+            await release.wait()
+
+        cpu, _, io, _ = tier(tmp_path, hold=hold)
+        task = asyncio.create_task(cpu.store("a"))
+        await started.wait()
+        task.cancel()
+        await asyncio.sleep(0.005)
+        assert not task.done() and cpu.summary()["cpu_pinned_pages"] == 1
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert io == [("write", "a", 32)]
+        assert cpu.summary()["cpu_pinned_pages"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_policy_invalidation_rejects_active_cpu_transfer(tmp_path):
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def hold(op, key):
+            started.set()
+            await release.wait()
+
+        cpu, _, _, _ = tier(tmp_path, hold=hold)
+        task = asyncio.create_task(cpu.store("a"))
+        await started.wait()
+        with pytest.raises(ValueError, match="active CPU"):
+            cpu.invalidate()
+        release.set()
+        await task
+        cpu.invalidate()
+        assert not cpu.fs_keys and not cpu.entries
+
+    asyncio.run(scenario())
+
+
+def test_completed_block_publish_requires_pinned_gpu_lease(tmp_path):
+    from kv_cache.agentrl import create_lifecycle
+
+    async def scenario():
+        runner = create_lifecycle(config(), tmp_path / "data", tmp_path / "results")
+        pool = runner.make_cache_pool(0, NVMeBackend(str(tmp_path / "kv")))
+        async with pool.lease(0, "r", "p", 4, 4, 0, iteration=0) as lease:
+            pool.materialize(lease, 4)
+        with pytest.raises(ValueError, match="pinned lease"):
+            await pool.publish(lease, 4, prompt_tokens=4)
+
+    asyncio.run(scenario())
+
+
+def test_store_cursor_does_not_recopy_old_prompt_each_decode_step(tmp_path):
+    from kv_cache.agentrl import create_lifecycle
+
+    async def scenario():
+        runner = create_lifecycle(config(cpu_capacity_bytes=256), tmp_path / "data", tmp_path / "results")
+        pool = runner.make_cache_pool(0, NVMeBackend(str(tmp_path / "kv")))
+        async with pool.lease(0, "r", "p", 4, 4, 2, iteration=0) as lease:
+            pool.materialize(lease, 4)
+            await pool.publish(lease, 4, prompt_tokens=4)
+            assert pool.tiers.stores == 2
+            pool.materialize(lease, 6)
+            await pool.publish(lease, 6, prompt_tokens=4)
+            assert pool.tiers.stores == 2
+            # New tool call reconsiders the longer prompt, matching a new
+            # native generation request rather than repeated decode stores.
+            await pool.publish(lease, 6, prompt_tokens=6)
+            assert pool.tiers.stores == 5
+            assert pool.tiers.fs_writes == 3
+        await pool.release_request("r")
+        assert not pool.published
+
+    asyncio.run(scenario())
+
+
+def config(mode="sync", **tier_fields):
+    raw = asdict(configured(mode, iterations=2))
+    raw["rollout_reference"] = reference(2, kv_budget_bytes_per_gpu=768)
+    raw["kv_cache_model"].pop("capacity_bytes")
+    raw["kv_offload_tiers"] = {"cpu_capacity_bytes": 512, **tier_fields}
+    return AgentRLConfig.from_dict(raw)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"cpu_capacity_bytes": 0},
+        {"cpu_capacity_bytes": True},
+        {"cpu_capacity_bytes": 255},
+        {"fs_capacity_bytes": 1024},
+        {"fs_enabled": "yes"},
+        {"offload_prompt_only": 1},
+        {"typo": 1},
+    ],
+)
+def test_invalid_tier_config_fails_before_io(fields):
+    with pytest.raises(ValueError, match="tier|CPU|cpu"):
+        config(**fields)
+
+
+def test_tiers_require_reference_and_gpu_capacity_model():
+    raw = asdict(tiny())
+    raw["kv_offload_tiers"] = {"cpu_capacity_bytes": 1024}
+    with pytest.raises(ValueError, match="tier.*reference|tier.*capacity"):
+        AgentRLConfig.from_dict(raw)
+
+
+@pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
+def test_completed_store_runs_without_gpu_pressure_and_cpu_only_control_is_zero_fs(tmp_path, mode):
+    for fs in (True, False):
+        raw = asdict(config(mode, fs_enabled=fs))
+        raw["rollout_reference"]["kv_budget_bytes_per_gpu"] = 64 * 1024
+        raw["kv_cache_model"].pop("capacity_bytes")
+        summary, trace, _ = execute(tmp_path / str(fs), AgentRLConfig.from_dict(raw))
+        assert (summary["io_totals"].get("kv_write", {}).get("payload_bytes", 0) > 0) == fs
+        if not fs:
+            assert not summary["io_totals"].get("kv_read")
+        assert trace["kv_offload_tiers"]["fidelity"] == "uncalibrated"
+        assert trace["kv_offload_tiers"]["settings"]["fs_capacity_bytes"] is None
+        assert summary["fidelity"] == "uncalibrated"
+
+
+def test_prompt_only_excludes_decode_blocks_and_incomplete_tail(tmp_path):
+    counts = []
+    for prompt_only in (True, False):
+        raw = asdict(config(offload_prompt_only=prompt_only))
+        raw.update(
+            iterations=1,
+            requests_per_rank=1,
+            concurrency=1,
+            prompt_tokens=3,
+            response_tokens=[6],
+            turns=1,
+            observation_tokens=0,
+            prefix_reuse_probability=0,
+        )
+        raw["rollout_reference"]["kv_budget_bytes_per_gpu"] = 64 * 1024
+        raw["kv_cache_model"].pop("capacity_bytes")
+        summary, _, _ = execute(tmp_path / str(prompt_only), AgentRLConfig.from_dict(raw))
+        counts.append(summary["io_totals"]["kv_write"]["payload_bytes"])
+    # One complete 2-token prompt block versus four complete history blocks.
+    assert counts == [256, 1024]
+
+
+@pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
+def test_cpu_fs_capacity_readback_recompute_and_policy_gc_are_connected(tmp_path, mode):
+    summary, trace, runner = execute(tmp_path, config(mode))
+    assert summary["io_totals"]["kv_read"]["payload_bytes"] > 0
+    assert any(e["event"] == "cpu_promote_end" for e in trace["events"])
+    assert any(e["event"] == "gpu_recompute_end" for e in trace["events"])
+    for pool in summary["ranks"][0]["kv_cache_model"]["owners"].values():
+        tiers = pool["offload_tiers"]
+        assert tiers["cpu_peak_bytes"] <= 512
+        assert tiers["cpu_reserved_bytes"] == tiers["cpu_pinned_pages"] == 0
+        assert tiers["fs_valid_payload_bytes"] == tiers["fs_capacity_evictions"] == 0
+    assert not list(runner.storage_dir.glob("**/kv/*.npy"))
+
+
+@pytest.mark.parametrize("mode,ranks", [("sync", 2), ("separate_async", 3)])
+def test_native_mpi_roles_preserve_cpu_budget_and_fs_payloads(tmp_path, mode, ranks):
+    raw = asdict(config(mode))
+    if mode != "sync":
+        raw["async_workload"].update(execution="mpi_shared", rollout_owners=2)
+    process = invoke(tmp_path, raw, ranks=ranks)
+    assert process.returncode == 0, process.stderr
+    summary = json.loads(next((tmp_path / "results").glob("*/summary.json")).read_text())
+    assert summary["io_totals"]["kv_write"]["payload_bytes"] > 0
+    for rank in summary["ranks"]:
+        for pool in rank["kv_cache_model"]["owners"].values():
+            assert pool["offload_tiers"]["cpu_peak_bytes"] <= 512
+
+
+@pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
+def test_larger_cpu_retains_completed_blocks_and_avoids_fs_promotion_reads(tmp_path, mode):
+    summary, trace, _ = execute(tmp_path, config(mode, cpu_capacity_bytes=65536))
+    assert any(e["event"] == "cpu_cache_hit" for e in trace["events"])
+    assert summary["io_totals"]["kv_write"]["payload_bytes"] > 0
+    assert not summary["io_totals"].get("kv_read")
+
+
+@pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
+def test_cascade_failure_prevents_successful_lifecycle_result(tmp_path, mode):
+    class Broken(NVMeBackend):
+        def write(self, key, data):
+            if self.base_path.name == "kv":
+                raise OSError("injected FS cascade failure")
+            return super().write(key, data)
+
+    with pytest.raises(Exception, match="FS cascade|TaskGroup"):
+        execute(tmp_path, config(mode), backend_factory=Broken)
+    assert not list((tmp_path / "results").glob("*/summary.json"))
+
+
+def test_tool_resume_makes_previous_decode_and_observation_history_prompt_eligible(tmp_path):
+    volumes = []
+    for turns in (1, 2):
+        raw = asdict(config())
+        raw.update(
+            iterations=1,
+            requests_per_rank=1,
+            concurrency=1,
+            prompt_tokens=4,
+            response_tokens=[6],
+            turns=turns,
+            observation_tokens=2,
+            prefix_reuse_probability=0,
+        )
+        raw["rollout_reference"]["kv_budget_bytes_per_gpu"] = 65536
+        raw["kv_cache_model"].pop("capacity_bytes")
+        summary, trace, _ = execute(tmp_path / str(turns), AgentRLConfig.from_dict(raw))
+        volumes.append(summary["io_totals"]["kv_write"]["payload_bytes"])
+        if turns == 2:
+            tool = next(e["t_s"] for e in trace["events"] if e["event"] == "tool_end")
+            assert any(e["event"] == "fs_cascade_end" and e["t_s"] > tool for e in trace["events"])
+    assert volumes == [512, 1024]
+
+
+def test_partial_policy_resume_refills_new_namespace_and_never_reads_invalidated_fs(tmp_path):
+    raw = asdict(config("colocate_async"))
+    raw.update(iterations=4, response_tokens=[2, 2, 30, 30])
+    raw["rollout_reference"]["kv_budget_bytes_per_gpu"] = 4096
+    raw["kv_cache_model"].pop("capacity_bytes")
+    _, trace, _ = execute(tmp_path, AgentRLConfig.from_dict(raw))
+    assert any(e["event"] == "re_prefill_end" and e["history_tokens"] > 4 for e in trace["events"])
+    for invalid in (e for e in trace["events"] if e["event"] == "cpu_fs_logical_invalidate"):
+        assert not any(
+            e["event"] == "io_begin"
+            and e["op"] == "read"
+            and e["key"] in invalid["fs_keys"]
+            and e["t_s"] > invalid["t_s"]
+            for e in trace["events"]
+        )

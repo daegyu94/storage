@@ -76,13 +76,15 @@ class Lease:
 
 
 class KVPool:
-    def __init__(self, settings, bytes_per_token, owner, io, emit):
+    def __init__(self, settings, bytes_per_token, owner, io, emit, *, tiers=None, recompute=None):
         self.settings, self.bytes_per_token, self.owner = settings, bytes_per_token, owner
         self.io, self.emit = io, emit
+        self.tiers, self.recompute = tiers, recompute
         self.page_bytes = settings.block_tokens * bytes_per_token
         self.entries = OrderedDict()
         self.condition = asyncio.Condition()
         self.prefix_locks = {}
+        self.published = {}
         self.used = self.peak = 0
         self.offload_ops = self.offload_bytes = self.reload_ops = self.reload_bytes = 0
         self.wait_events, self.wait_s = 0, 0.0
@@ -158,7 +160,7 @@ class KVPool:
                     break
                 if key in wanted or not entry.resident or entry.pins:
                     continue
-                if entry.size and entry.dirty:
+                if entry.size and entry.dirty and self.tiers is None:
                     await self.io("write", key, entry.size, **lease.context)
                     entry.stored_size, entry.dirty = entry.size, False
                     self.offload_ops += 1
@@ -169,7 +171,11 @@ class KVPool:
             for key, (request, _) in wanted.items():
                 entry = self.entries.setdefault(key, Block(request))
                 if not entry.resident:
-                    if entry.stored_size is not None:
+                    if self.tiers is not None and entry.size:
+                        loaded = await self.tiers.load(key, **lease.context)
+                        if not loaded:
+                            await self.recompute(key, entry.size, **lease.context)
+                    elif entry.stored_size is not None:
                         await self.io("read", key, entry.stored_size, **lease.context)
                         self.reload_ops += 1
                         self.reload_bytes += entry.stored_size
@@ -206,16 +212,34 @@ class KVPool:
             if entry.size != size:
                 entry.size, entry.dirty = size, True
 
+    async def publish(self, lease, history, *, prompt_tokens):
+        if self.tiers is None:
+            return
+        if not lease.active:
+            raise ValueError("completed block publish requires a pinned lease")
+        call = (lease.policy, prompt_tokens)
+        previous = self.published.get(lease.request)
+        if previous is None or previous[0] != call:
+            previous = self.published[lease.request] = (call, set())
+        stored = previous[1]
+        limit = prompt_tokens if self.tiers.settings.offload_prompt_only else history
+        eligible = self.plan(lease.policy, lease.request, lease.prefix_id, lease.prefix_tokens, limit)
+        for key, (_, size) in eligible.items():
+            if key not in stored and size == self.page_bytes and self.entries[key].size == self.page_bytes:
+                await self.tiers.store(key, **lease.context)
+                stored.add(key)
+
     async def release_request(self, request):
         async with self.condition:
             keys = [k for k, e in self.entries.items() if e.request == request]
             if any(self.entries[k].pins for k in keys):
                 raise ValueError("cannot retire pinned request KV")
+            self.published.pop(request, None)
             physical = []
             for key in keys:
                 entry = self.entries.pop(key)
                 self.used -= self.page_bytes if entry.resident else 0
-                if entry.stored_size is not None:
+                if entry.stored_size is not None and self.tiers is None:
                     physical.append(key)
             self.emit("cache_request_release", request=request, keys=keys, resident_bytes=self.used)
             self.condition.notify_all()
@@ -224,9 +248,12 @@ class KVPool:
     def invalidate(self):
         if self.condition.locked() or any(e.pins for e in self.entries.values()):
             raise ValueError("cannot invalidate pinned KV")
+        if self.tiers is not None:
+            self.tiers.invalidate()
         self.emit("cache_logical_invalidate", keys=list(self.entries), resident_bytes=self.used)
         self.entries.clear()
         self.prefix_locks.clear()
+        self.published.clear()
         # Sync creates a fresh event loop for each collective phase. Reset
         # loop-bound primitives only after the complete owner has drained.
         self.condition = asyncio.Condition()
@@ -249,4 +276,5 @@ class KVPool:
             "capacity_wait_s": self.wait_s,
             "residency_model": "chunk_safe_working_set",
             "storage_capacity_bounded": False,
+            **({"offload_tiers": self.tiers.summary()} if self.tiers is not None else {}),
         }
