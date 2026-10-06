@@ -563,15 +563,20 @@ class AsyncLifecycle(SyncLifecycle):
         self.event("rollout_pause_end", reason=reason, policy=self.version)
 
     def retire_kv(self):
+        snapshot = (
+            [(owner, k) for owner, pool in self.cache_pools.items() for k in sorted(pool.tiers.fs_keys)]
+            if self.persistent_fs
+            else []
+        )
         for pool in self.cache_pools.values():
             pool.invalidate()
-        snapshot = []
         for owner, data in enumerate(self.owners):
-            for key in list(data["kv"].metadata):
-                identity = (owner, key)
-                if identity not in self.retired:
-                    self.retired.add(identity)
-                    snapshot.append(identity)
+            if not self.persistent_fs:
+                for key in list(data["kv"].metadata):
+                    identity = (owner, key)
+                    if identity not in self.retired:
+                        self.retired.add(identity)
+                        snapshot.append(identity)
             data["prefixes"].clear()
             data["prefix_locks"].clear()
         if not snapshot:
@@ -581,7 +586,8 @@ class AsyncLifecycle(SyncLifecycle):
     def queue_retirement(self, snapshot):
         if not snapshot:
             return
-        self.retired.update(snapshot)
+        if not self.persistent_fs:
+            self.retired.update(snapshot)
         retirement = self.retirement_sequence
         self.retirement_sequence += 1
         self.event(
@@ -589,8 +595,11 @@ class AsyncLifecycle(SyncLifecycle):
             retirement_id=retirement,
             policy=self.version,
             keys=[k for _, k in snapshot],
-            modeled_gc_delay_s=self.settings.kv_gc_delay_s,
+            modeled_gc_delay_s=0 if self.persistent_fs else self.settings.kv_gc_delay_s,
         )
+        if self.persistent_fs:
+            self.retain_fs([k for _, k in snapshot], retirement_id=retirement, policy=self.version)
+            return
         task = self.jobs.create_task(self.gc(snapshot, retirement, self.version, self.trace.iteration))
         self.gc_jobs.add(task)
         task.add_done_callback(self.gc_jobs.discard)

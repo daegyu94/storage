@@ -19,6 +19,7 @@ class TierSettings:
     offload_prompt_only: bool = True
     fs_execution: str = "caller_await"
     fs_write_workers: int = 16
+    fs_retention: str = "policy_gc"
 
     @property
     def promotion_admission(self):
@@ -42,6 +43,10 @@ class TierSettings:
             raise ValueError("tier FS execution must be caller_await or background")
         if type(result.fs_write_workers) is not int or result.fs_write_workers <= 0:
             raise ValueError("tier FS write workers must be a positive integer")
+        if result.fs_retention not in ("policy_gc", "persistent"):
+            raise ValueError("tier FS retention must be policy_gc or persistent")
+        if result.fs_retention == "persistent" and not result.fs_enabled:
+            raise ValueError("persistent FS retention requires fs_enabled")
         return result
 
     def validate(self, config):
@@ -321,6 +326,7 @@ class CPUPrimary:
             "cpu_store_skipped": self.store_skipped,
             "cpu_store_skipped_payload_bytes": self.store_skipped * self.page_bytes,
             "fs_execution": self.settings.fs_execution,
+            "fs_retention": self.settings.fs_retention,
             "fs_write_workers": self.settings.fs_write_workers,
             "fs_pending_stores": len(self.pending),
             "fs_pending_peak": self.pending_peak,

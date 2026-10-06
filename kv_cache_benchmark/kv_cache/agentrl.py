@@ -369,6 +369,8 @@ class SyncLifecycle:
         self.prefix_locks = {}
         self.io_sequence = self.io_active = self.io_active_peak = 0
         self.kv_sizes = {}
+        self.kv_file_sizes = {}
+        self.kv_live_bytes = self.kv_physical_bytes = self.kv_physical_peak_bytes = 0
         self.kv_peak_bytes = 0
         self.completed_requests = []
         self.cache_pools = {}
@@ -433,6 +435,22 @@ class SyncLifecycle:
 
     def io_context(self):
         return {}
+
+    @property
+    def persistent_fs(self):
+        return (self.config.kv_offload_tiers or {}).get("fs_retention", "policy_gc") == "persistent"
+
+    def retain_fs(self, keys, **context):
+        """Report a drained logical retirement; file ownership remains unchanged."""
+        if keys:
+            self.trace.emit(
+                "kv_fs_retained",
+                keys=keys,
+                file_count=len(keys),
+                payload_bytes=sum(self.kv_sizes[k] for k in keys),
+                physical_file_bytes=sum(self.kv_file_sizes[k] for k in keys),
+                **context,
+            )
 
     def make_cache_pool(self, owner, backend):
         from kv_cache.agentrl_kv import CacheSettings, KVPool
@@ -631,20 +649,26 @@ class SyncLifecycle:
             else:
                 raise ValueError(f"unsupported I/O operation: {op}")
             actual_s = time.monotonic() - started
+            # Completed file length includes the NumPy header, not device or wire traffic.
+            physical = backend._get_path(key).stat().st_size if op != "delete" else 0
             if kind == "kv":
                 if op == "write":
+                    self.kv_live_bytes += size - self.kv_sizes.get(key, 0)
+                    self.kv_physical_bytes += physical - self.kv_file_sizes.get(key, 0)
                     self.kv_sizes[key] = size
+                    self.kv_file_sizes[key] = physical
                 elif op == "delete":
-                    self.kv_sizes.pop(key, None)
-                self.kv_peak_bytes = max(self.kv_peak_bytes, sum(self.kv_sizes.values()))
-            # File length includes the NumPy header, not device or wire traffic.
-            physical = backend._get_path(key).stat().st_size if op != "delete" else 0
+                    self.kv_live_bytes -= self.kv_sizes.pop(key, 0)
+                    self.kv_physical_bytes -= self.kv_file_sizes.pop(key, 0)
+                self.kv_peak_bytes = max(self.kv_peak_bytes, self.kv_live_bytes)
+                self.kv_physical_peak_bytes = max(self.kv_physical_peak_bytes, self.kv_physical_bytes)
             measured = {
                 "bytes": size,
                 "actual_s": actual_s,
                 "backend_s": timing.total if timing else None,
                 "physical_file_bytes": physical,
-                "kv_live_payload_bytes": sum(self.kv_sizes.values()),
+                "kv_live_payload_bytes": self.kv_live_bytes,
+                "kv_live_physical_file_bytes": self.kv_physical_bytes,
             }
             self.trace.emit("io_actual_end", **identity, **measured)
             estimated_s = network_delay(self.config, size)
@@ -1044,15 +1068,23 @@ class SyncLifecycle:
         self.trace.emit("recovery_end", policy=self.version)
 
     async def invalidate(self):
+        snapshot = (
+            sorted(k for pool in self.cache_pools.values() for k in pool.tiers.fs_keys) if self.persistent_fs else []
+        )
         for pool in self.cache_pools.values():
             pool.invalidate()
-        for key in list(self.kv.metadata):
-            await self.io(self.kv, "delete", key, kind="kv")
+        if self.persistent_fs:
+            self.retain_fs(snapshot, policy=self.version)
+        else:
+            for key in list(self.kv.metadata):
+                await self.io(self.kv, "delete", key, kind="kv")
         self.prefixes.clear()
         self.prefix_locks.clear()
         self.trace.emit("kv_invalidate", policy=self.version)
 
     def rank_summary(self):
+        valid_fs = {k for pool in self.cache_pools.values() if pool.tiers for k in pool.tiers.fs_keys}
+        retained = self.kv_sizes.keys() - valid_fs if self.persistent_fs else set()
         totals = {}
         for event in self.trace.events:
             if event["event"] == "io_end":
@@ -1079,8 +1111,13 @@ class SyncLifecycle:
             "achieved_decode_tokens_per_s": generated_tokens / rollout_s if rollout_s else 0,
             "compute_queue_wait_s": sum(e.get("compute_queue_wait_s", 0) for e in self.trace.events),
             "modeled_decode_service_s": sum(e.get("modeled_compute_s", 0) for e in self.trace.events),
-            "kv_live_payload_bytes": sum(self.kv_sizes.values()),
+            "kv_live_payload_bytes": self.kv_live_bytes,
             "kv_peak_payload_bytes": self.kv_peak_bytes,
+            "kv_live_physical_file_bytes": self.kv_physical_bytes,
+            "kv_peak_physical_file_bytes": self.kv_physical_peak_bytes,
+            "kv_retained_file_count": len(retained),
+            "kv_retained_payload_bytes": sum(self.kv_sizes[k] for k in retained),
+            "kv_retained_physical_file_bytes": sum(self.kv_file_sizes[k] for k in retained),
             **(
                 {"kv_cache_model": {"owners": {str(owner): pool.summary() for owner, pool in self.cache_pools.items()}}}
                 if self.config.kv_cache_model is not None

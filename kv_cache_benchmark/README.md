@@ -121,3 +121,27 @@ KV cache benchmark results are calculated for each workload:
 Each workload is run three times. The final submission results that will be displayed in the results table is the mean of the three runs for throughput and bandwidth, and the max of the three runs for latency. These results are reported in the generated `summary.json` file at the root of the run's result directory.
 
 
+## Experimental Agent RL lifecycle extension
+
+`agent-rl.py` uses the existing model geometry and NVMe backend to execute a GPU-less rollout, trajectory, policy-update and checkpoint lifecycle.
+Results use `benchmark: experimental-agentrl` and `fidelity: uncalibrated`; they are not official MLPerf submissions.
+Run `python agent-rl.py --help` for the config, storage, result and MPI options.
+
+When `kv_offload_tiers` is configured with reference geometry and a GPU-like KV capacity, `fs_retention` controls the physical lifetime of completed KV files:
+
+| Setting | Behavior |
+| --- | --- |
+| `policy_gc` (default) | Sync deletes retired files; async schedules the existing deferred GC. |
+| `persistent` | Retains files across policy transitions and after the run. Requires `fs_enabled: true`. |
+
+Both choices drain admitted transfers, clear CPU/GPU-like logical cache entries and isolate new-policy keys.
+Persistent files are ineligible for old-policy reads; checkpoint recovery starts with cold KV in a new run namespace.
+`fs_capacity_bytes: null` disables logical FS capacity eviction; actual filesystem errors still fail the run.
+Async `kv_gc_delay_s` has no effect in persistent mode because no KV GC task is scheduled.
+
+The `kv_live_physical_file_bytes` and `kv_peak_physical_file_bytes` metrics track successfully completed file lengths, including NumPy headers.
+The `kv_retained_*` rank metrics describe files outside the current logical FS index; `kv_fs_retained` records each logical retirement snapshot.
+Repeated retirements in one policy may describe the same physical key, so event snapshot totals need not equal unique occupancy.
+These are file-length observations, not device allocation, host RSS, DMA or network traffic.
+CPU capacity remains a metadata reservation budget; persistent FS metadata grows with the number of files.
+Retained files require explicit cleanup by the experiment owner and are not automatically reused across runs.
