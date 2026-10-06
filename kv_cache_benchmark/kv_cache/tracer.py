@@ -18,7 +18,8 @@ Output format (one row per operation):
                      file path in the replay tool (e.g. S3 key, fio filename)
     Phase            'Prefill' (initial write), 'Decode' (per-token read),
                      'Evict' (waterfall demotion), 'Replicate' (cascade
-                     fan-out), or 'Promote' (cascade read-through population)
+                     fan-out), 'Promote' (read-through population), or
+                     'Backup' (GPU-to-host backup)
 
 Tier mapping:
     Tier-0  = GPU VRAM

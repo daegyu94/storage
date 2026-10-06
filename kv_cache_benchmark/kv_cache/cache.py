@@ -221,10 +221,12 @@ class MultiTierCache:
                  io_tracer: Optional['IOTracer'] = None,
                  tiering_policy: str = 'waterfall'):
 
-        if tiering_policy not in ('waterfall', 'cascade'):
+        if tiering_policy not in ('waterfall', 'cascade', 'gpu-write-through', 'gpu-selective', 'gpu-write-back'):
             raise ValueError(f'Unknown tiering policy: {tiering_policy}')
         if tiering_policy == 'cascade' and cpu_memory_gb <= 0:
             raise ValueError('cascade requires a positive CPU primary capacity')
+        if tiering_policy.startswith('gpu-') and cpu_memory_gb <= 0:
+            raise ValueError(f'{tiering_policy} requires a positive CPU capacity')
         self.tiering_policy = tiering_policy
         self._cascade = None
 
@@ -259,7 +261,7 @@ class MultiTierCache:
             self.backends['cpu'] = CPUMemoryBackend()
             self.backends['nvme'] = NVMeBackend(base_path=cache_dir)
 
-        self.generator = (None if tiering_policy == 'cascade' and io_tracer is not None
+        self.generator = (None if tiering_policy != 'waterfall' and io_tracer is not None
                           else KVCacheGenerator(model_config, global_seed=self.seed))
 
         self.cache_entries = {}
@@ -316,6 +318,9 @@ class MultiTierCache:
         if tiering_policy == 'cascade':
             from kv_cache.cascade import CascadePolicy
             self._cascade = CascadePolicy(self)
+        elif tiering_policy.startswith('gpu-'):
+            from kv_cache.gpu_backup import GPUBackupPolicy
+            self._cascade = GPUBackupPolicy(self)
 
     def _get_entry_lock(self, key: str) -> threading.Lock:
         """Get or create a lock for a specific cache entry."""

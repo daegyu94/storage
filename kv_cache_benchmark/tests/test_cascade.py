@@ -244,6 +244,9 @@ def test_trace_promotion_does_not_materialize_payload(tmp_path, monkeypatch):
 @pytest.mark.parametrize('configured,explicit,expected', [
     (None, None, 'waterfall'), ('cascade', None, 'cascade'),
     ('cascade', 'waterfall', 'waterfall'), ('waterfall', 'cascade', 'cascade'),
+    ('gpu-selective', None, 'gpu-selective'),
+    ('waterfall', 'gpu-write-back', 'gpu-write-back'),
+    (None, 'gpu-write-through', 'gpu-write-through'),
 ])
 def test_standalone_cli_policy_precedence(tmp_path, monkeypatch, configured, explicit, expected):
     import kv_cache.cli as cli

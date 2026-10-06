@@ -143,7 +143,7 @@ class ConfigLoader:
         self._validate_keys(self.config, self.VALID_SCHEMA, path_prefix='')
 
         policy = self.get('tiering', 'policy', default='waterfall')
-        if policy not in ('waterfall', 'cascade'):
+        if policy not in ('waterfall', 'cascade', 'gpu-write-through', 'gpu-selective', 'gpu-write-back'):
             raise ValueError(f'Unknown tiering policy: {policy}')
 
         logger.info(f"Loaded configuration from {config_path}")

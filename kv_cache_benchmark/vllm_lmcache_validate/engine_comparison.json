@@ -1,0 +1,1585 @@
+{
+  "scope": "completed payload operations; flat entries; sequential requests",
+  "entry_bytes": 64,
+  "gpu_capacity_bytes": 160,
+  "cpu_capacity_bytes": 160,
+  "nvme_capacity_bytes": 512,
+  "scenarios": {
+    "fit_once": {
+      "waterfall": {
+        "nvme_read_bytes": 0,
+        "nvme_write_bytes": 0,
+        "hit_tiers": [],
+        "tier_hits": {},
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": null,
+          "cpu": null,
+          "nvme": null
+        },
+        "eviction_io_bytes": null,
+        "replication_bytes": 0,
+        "promotion_nvme_cpu_bytes": 0,
+        "promotion_cpu_gpu_bytes": 0,
+        "backup_bytes": {
+          "insertion": 0,
+          "reuse": 0,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": null,
+          "cpu": null,
+          "nvme": null
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "a": [
+            "gpu"
+          ],
+          "b": [
+            "gpu"
+          ]
+        }
+      },
+      "cascade": {
+        "nvme_read_bytes": 0,
+        "nvme_write_bytes": 128,
+        "hit_tiers": [],
+        "tier_hits": {},
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": 0,
+          "cpu": 0,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 0,
+        "replication_bytes": 128,
+        "promotion_nvme_cpu_bytes": 0,
+        "promotion_cpu_gpu_bytes": 0,
+        "backup_bytes": {
+          "insertion": 0,
+          "reuse": 0,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": 0,
+          "cpu": 0,
+          "nvme": 0
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "a": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ],
+          "b": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ]
+        }
+      },
+      "gpu-write-through": {
+        "nvme_read_bytes": 0,
+        "nvme_write_bytes": 128,
+        "hit_tiers": [],
+        "tier_hits": {},
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": 0,
+          "cpu": 0,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 0,
+        "replication_bytes": 128,
+        "promotion_nvme_cpu_bytes": 0,
+        "promotion_cpu_gpu_bytes": 0,
+        "backup_bytes": {
+          "insertion": 128,
+          "reuse": 0,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": 0,
+          "cpu": 0,
+          "nvme": 0
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "a": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ],
+          "b": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ]
+        }
+      },
+      "gpu-selective": {
+        "nvme_read_bytes": 0,
+        "nvme_write_bytes": 0,
+        "hit_tiers": [],
+        "tier_hits": {},
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": 0,
+          "cpu": 0,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 0,
+        "replication_bytes": 0,
+        "promotion_nvme_cpu_bytes": 0,
+        "promotion_cpu_gpu_bytes": 0,
+        "backup_bytes": {
+          "insertion": 0,
+          "reuse": 0,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": 0,
+          "cpu": 0,
+          "nvme": 0
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "a": [
+            "gpu"
+          ],
+          "b": [
+            "gpu"
+          ]
+        }
+      },
+      "gpu-write-back": {
+        "nvme_read_bytes": 0,
+        "nvme_write_bytes": 0,
+        "hit_tiers": [],
+        "tier_hits": {},
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": 0,
+          "cpu": 0,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 0,
+        "replication_bytes": 0,
+        "promotion_nvme_cpu_bytes": 0,
+        "promotion_cpu_gpu_bytes": 0,
+        "backup_bytes": {
+          "insertion": 0,
+          "reuse": 0,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": 0,
+          "cpu": 0,
+          "nvme": 0
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "a": [
+            "gpu"
+          ],
+          "b": [
+            "gpu"
+          ]
+        }
+      }
+    },
+    "fit_reuse": {
+      "waterfall": {
+        "nvme_read_bytes": 0,
+        "nvme_write_bytes": 0,
+        "hit_tiers": [
+          "gpu",
+          "gpu",
+          "gpu"
+        ],
+        "tier_hits": {
+          "gpu": 3
+        },
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": null,
+          "cpu": null,
+          "nvme": null
+        },
+        "eviction_io_bytes": null,
+        "replication_bytes": 0,
+        "promotion_nvme_cpu_bytes": 0,
+        "promotion_cpu_gpu_bytes": 0,
+        "backup_bytes": {
+          "insertion": 0,
+          "reuse": 0,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": null,
+          "cpu": null,
+          "nvme": null
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "a": [
+            "gpu"
+          ],
+          "b": [
+            "gpu"
+          ]
+        }
+      },
+      "cascade": {
+        "nvme_read_bytes": 0,
+        "nvme_write_bytes": 128,
+        "hit_tiers": [
+          "gpu",
+          "gpu",
+          "gpu"
+        ],
+        "tier_hits": {
+          "gpu": 3
+        },
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": 0,
+          "cpu": 0,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 0,
+        "replication_bytes": 128,
+        "promotion_nvme_cpu_bytes": 0,
+        "promotion_cpu_gpu_bytes": 0,
+        "backup_bytes": {
+          "insertion": 0,
+          "reuse": 0,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": 0,
+          "cpu": 0,
+          "nvme": 0
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "a": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ],
+          "b": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ]
+        }
+      },
+      "gpu-write-through": {
+        "nvme_read_bytes": 0,
+        "nvme_write_bytes": 128,
+        "hit_tiers": [
+          "gpu",
+          "gpu",
+          "gpu"
+        ],
+        "tier_hits": {
+          "gpu": 3
+        },
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": 0,
+          "cpu": 0,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 0,
+        "replication_bytes": 128,
+        "promotion_nvme_cpu_bytes": 0,
+        "promotion_cpu_gpu_bytes": 0,
+        "backup_bytes": {
+          "insertion": 128,
+          "reuse": 0,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": 0,
+          "cpu": 0,
+          "nvme": 0
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "a": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ],
+          "b": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ]
+        }
+      },
+      "gpu-selective": {
+        "nvme_read_bytes": 0,
+        "nvme_write_bytes": 64,
+        "hit_tiers": [
+          "gpu",
+          "gpu",
+          "gpu"
+        ],
+        "tier_hits": {
+          "gpu": 3
+        },
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": 0,
+          "cpu": 0,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 0,
+        "replication_bytes": 64,
+        "promotion_nvme_cpu_bytes": 0,
+        "promotion_cpu_gpu_bytes": 0,
+        "backup_bytes": {
+          "insertion": 0,
+          "reuse": 64,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": 0,
+          "cpu": 0,
+          "nvme": 0
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "a": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ],
+          "b": [
+            "gpu"
+          ]
+        }
+      },
+      "gpu-write-back": {
+        "nvme_read_bytes": 0,
+        "nvme_write_bytes": 0,
+        "hit_tiers": [
+          "gpu",
+          "gpu",
+          "gpu"
+        ],
+        "tier_hits": {
+          "gpu": 3
+        },
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": 0,
+          "cpu": 0,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 0,
+        "replication_bytes": 0,
+        "promotion_nvme_cpu_bytes": 0,
+        "promotion_cpu_gpu_bytes": 0,
+        "backup_bytes": {
+          "insertion": 0,
+          "reuse": 0,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": 0,
+          "cpu": 0,
+          "nvme": 0
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "a": [
+            "gpu"
+          ],
+          "b": [
+            "gpu"
+          ]
+        }
+      }
+    },
+    "cold_pressure": {
+      "waterfall": {
+        "nvme_read_bytes": 192,
+        "nvme_write_bytes": 64,
+        "hit_tiers": [
+          "nvme",
+          "nvme",
+          "nvme"
+        ],
+        "tier_hits": {
+          "nvme": 3
+        },
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": null,
+          "cpu": null,
+          "nvme": null
+        },
+        "eviction_io_bytes": null,
+        "replication_bytes": 0,
+        "promotion_nvme_cpu_bytes": 0,
+        "promotion_cpu_gpu_bytes": 0,
+        "backup_bytes": {
+          "insertion": 0,
+          "reuse": 0,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": null,
+          "cpu": null,
+          "nvme": null
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "a": [
+            "nvme"
+          ],
+          "b": [
+            "cpu"
+          ],
+          "c": [
+            "cpu"
+          ],
+          "d": [
+            "gpu"
+          ],
+          "e": [
+            "gpu"
+          ]
+        }
+      },
+      "cascade": {
+        "nvme_read_bytes": 64,
+        "nvme_write_bytes": 320,
+        "hit_tiers": [
+          "nvme",
+          "gpu",
+          "gpu"
+        ],
+        "tier_hits": {
+          "nvme": 1,
+          "gpu": 2
+        },
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": 1,
+          "cpu": 1,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 0,
+        "replication_bytes": 320,
+        "promotion_nvme_cpu_bytes": 64,
+        "promotion_cpu_gpu_bytes": 64,
+        "backup_bytes": {
+          "insertion": 0,
+          "reuse": 0,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": 4,
+          "cpu": 4,
+          "nvme": 0
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "a": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ],
+          "b": [
+            "nvme"
+          ],
+          "c": [
+            "nvme"
+          ],
+          "d": [
+            "nvme"
+          ],
+          "e": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ]
+        }
+      },
+      "gpu-write-through": {
+        "nvme_read_bytes": 64,
+        "nvme_write_bytes": 320,
+        "hit_tiers": [
+          "nvme",
+          "gpu",
+          "gpu"
+        ],
+        "tier_hits": {
+          "nvme": 1,
+          "gpu": 2
+        },
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": 1,
+          "cpu": 1,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 0,
+        "replication_bytes": 320,
+        "promotion_nvme_cpu_bytes": 64,
+        "promotion_cpu_gpu_bytes": 64,
+        "backup_bytes": {
+          "insertion": 320,
+          "reuse": 0,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": 4,
+          "cpu": 4,
+          "nvme": 0
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "a": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ],
+          "b": [
+            "nvme"
+          ],
+          "c": [
+            "nvme"
+          ],
+          "d": [
+            "nvme"
+          ],
+          "e": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ]
+        }
+      },
+      "gpu-selective": {
+        "nvme_read_bytes": 0,
+        "nvme_write_bytes": 0,
+        "hit_tiers": [
+          null,
+          null,
+          null
+        ],
+        "tier_hits": {
+          "miss": 3
+        },
+        "cache_misses": 3,
+        "tier_probe_misses": {
+          "gpu": 3,
+          "cpu": 3,
+          "nvme": 3
+        },
+        "eviction_io_bytes": 0,
+        "replication_bytes": 0,
+        "promotion_nvme_cpu_bytes": 0,
+        "promotion_cpu_gpu_bytes": 0,
+        "backup_bytes": {
+          "insertion": 0,
+          "reuse": 0,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": 3,
+          "cpu": 0,
+          "nvme": 0
+        },
+        "discarded_unbacked_entries": 3,
+        "replicas": {
+          "d": [
+            "gpu"
+          ],
+          "e": [
+            "gpu"
+          ]
+        }
+      },
+      "gpu-write-back": {
+        "nvme_read_bytes": 64,
+        "nvme_write_bytes": 256,
+        "hit_tiers": [
+          "nvme",
+          "gpu",
+          "gpu"
+        ],
+        "tier_hits": {
+          "nvme": 1,
+          "gpu": 2
+        },
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": 1,
+          "cpu": 1,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 1024,
+        "replication_bytes": 256,
+        "promotion_nvme_cpu_bytes": 64,
+        "promotion_cpu_gpu_bytes": 64,
+        "backup_bytes": {
+          "insertion": 0,
+          "reuse": 0,
+          "eviction": 256
+        },
+        "tier_evictions": {
+          "gpu": 4,
+          "cpu": 3,
+          "nvme": 0
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "a": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ],
+          "b": [
+            "nvme"
+          ],
+          "c": [
+            "nvme"
+          ],
+          "d": [
+            "cpu",
+            "nvme"
+          ],
+          "e": [
+            "gpu"
+          ]
+        }
+      }
+    },
+    "selected_survives": {
+      "waterfall": {
+        "nvme_read_bytes": 192,
+        "nvme_write_bytes": 64,
+        "hit_tiers": [
+          "gpu",
+          "nvme",
+          "nvme",
+          "nvme"
+        ],
+        "tier_hits": {
+          "gpu": 1,
+          "nvme": 3
+        },
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": null,
+          "cpu": null,
+          "nvme": null
+        },
+        "eviction_io_bytes": null,
+        "replication_bytes": 0,
+        "promotion_nvme_cpu_bytes": 0,
+        "promotion_cpu_gpu_bytes": 0,
+        "backup_bytes": {
+          "insertion": 0,
+          "reuse": 0,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": null,
+          "cpu": null,
+          "nvme": null
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "a": [
+            "nvme"
+          ],
+          "b": [
+            "cpu"
+          ],
+          "c": [
+            "cpu"
+          ],
+          "d": [
+            "gpu"
+          ],
+          "e": [
+            "gpu"
+          ]
+        }
+      },
+      "cascade": {
+        "nvme_read_bytes": 64,
+        "nvme_write_bytes": 320,
+        "hit_tiers": [
+          "gpu",
+          "nvme",
+          "gpu",
+          "gpu"
+        ],
+        "tier_hits": {
+          "gpu": 3,
+          "nvme": 1
+        },
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": 1,
+          "cpu": 1,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 0,
+        "replication_bytes": 320,
+        "promotion_nvme_cpu_bytes": 64,
+        "promotion_cpu_gpu_bytes": 64,
+        "backup_bytes": {
+          "insertion": 0,
+          "reuse": 0,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": 4,
+          "cpu": 4,
+          "nvme": 0
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "a": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ],
+          "b": [
+            "nvme"
+          ],
+          "c": [
+            "nvme"
+          ],
+          "d": [
+            "nvme"
+          ],
+          "e": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ]
+        }
+      },
+      "gpu-write-through": {
+        "nvme_read_bytes": 64,
+        "nvme_write_bytes": 320,
+        "hit_tiers": [
+          "gpu",
+          "nvme",
+          "gpu",
+          "gpu"
+        ],
+        "tier_hits": {
+          "gpu": 3,
+          "nvme": 1
+        },
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": 1,
+          "cpu": 1,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 0,
+        "replication_bytes": 320,
+        "promotion_nvme_cpu_bytes": 64,
+        "promotion_cpu_gpu_bytes": 64,
+        "backup_bytes": {
+          "insertion": 320,
+          "reuse": 0,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": 4,
+          "cpu": 4,
+          "nvme": 0
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "a": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ],
+          "b": [
+            "nvme"
+          ],
+          "c": [
+            "nvme"
+          ],
+          "d": [
+            "nvme"
+          ],
+          "e": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ]
+        }
+      },
+      "gpu-selective": {
+        "nvme_read_bytes": 0,
+        "nvme_write_bytes": 64,
+        "hit_tiers": [
+          "gpu",
+          "cpu",
+          "gpu",
+          "gpu"
+        ],
+        "tier_hits": {
+          "gpu": 3,
+          "cpu": 1
+        },
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": 1,
+          "cpu": 0,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 0,
+        "replication_bytes": 64,
+        "promotion_nvme_cpu_bytes": 0,
+        "promotion_cpu_gpu_bytes": 64,
+        "backup_bytes": {
+          "insertion": 0,
+          "reuse": 64,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": 4,
+          "cpu": 0,
+          "nvme": 0
+        },
+        "discarded_unbacked_entries": 3,
+        "replicas": {
+          "a": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ],
+          "e": [
+            "gpu"
+          ]
+        }
+      },
+      "gpu-write-back": {
+        "nvme_read_bytes": 64,
+        "nvme_write_bytes": 256,
+        "hit_tiers": [
+          "gpu",
+          "nvme",
+          "gpu",
+          "gpu"
+        ],
+        "tier_hits": {
+          "gpu": 3,
+          "nvme": 1
+        },
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": 1,
+          "cpu": 1,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 1024,
+        "replication_bytes": 256,
+        "promotion_nvme_cpu_bytes": 64,
+        "promotion_cpu_gpu_bytes": 64,
+        "backup_bytes": {
+          "insertion": 0,
+          "reuse": 0,
+          "eviction": 256
+        },
+        "tier_evictions": {
+          "gpu": 4,
+          "cpu": 3,
+          "nvme": 0
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "a": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ],
+          "b": [
+            "nvme"
+          ],
+          "c": [
+            "nvme"
+          ],
+          "d": [
+            "cpu",
+            "nvme"
+          ],
+          "e": [
+            "gpu"
+          ]
+        }
+      }
+    },
+    "thrashing": {
+      "waterfall": {
+        "nvme_read_bytes": 128,
+        "nvme_write_bytes": 64,
+        "hit_tiers": [
+          "nvme",
+          "cpu",
+          "cpu",
+          "gpu",
+          "gpu",
+          "nvme",
+          "cpu",
+          "cpu",
+          "gpu",
+          "gpu"
+        ],
+        "tier_hits": {
+          "nvme": 2,
+          "cpu": 4,
+          "gpu": 4
+        },
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": null,
+          "cpu": null,
+          "nvme": null
+        },
+        "eviction_io_bytes": null,
+        "replication_bytes": 0,
+        "promotion_nvme_cpu_bytes": 0,
+        "promotion_cpu_gpu_bytes": 0,
+        "backup_bytes": {
+          "insertion": 0,
+          "reuse": 0,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": null,
+          "cpu": null,
+          "nvme": null
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "a": [
+            "nvme"
+          ],
+          "b": [
+            "cpu"
+          ],
+          "c": [
+            "cpu"
+          ],
+          "d": [
+            "gpu"
+          ],
+          "e": [
+            "gpu"
+          ]
+        }
+      },
+      "cascade": {
+        "nvme_read_bytes": 640,
+        "nvme_write_bytes": 320,
+        "hit_tiers": [
+          "nvme",
+          "nvme",
+          "nvme",
+          "nvme",
+          "nvme",
+          "nvme",
+          "nvme",
+          "nvme",
+          "nvme",
+          "nvme"
+        ],
+        "tier_hits": {
+          "nvme": 10
+        },
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": 10,
+          "cpu": 10,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 0,
+        "replication_bytes": 320,
+        "promotion_nvme_cpu_bytes": 640,
+        "promotion_cpu_gpu_bytes": 640,
+        "backup_bytes": {
+          "insertion": 0,
+          "reuse": 0,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": 13,
+          "cpu": 13,
+          "nvme": 0
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "a": [
+            "nvme"
+          ],
+          "b": [
+            "nvme"
+          ],
+          "c": [
+            "nvme"
+          ],
+          "d": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ],
+          "e": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ]
+        }
+      },
+      "gpu-write-through": {
+        "nvme_read_bytes": 640,
+        "nvme_write_bytes": 320,
+        "hit_tiers": [
+          "nvme",
+          "nvme",
+          "nvme",
+          "nvme",
+          "nvme",
+          "nvme",
+          "nvme",
+          "nvme",
+          "nvme",
+          "nvme"
+        ],
+        "tier_hits": {
+          "nvme": 10
+        },
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": 10,
+          "cpu": 10,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 0,
+        "replication_bytes": 320,
+        "promotion_nvme_cpu_bytes": 640,
+        "promotion_cpu_gpu_bytes": 640,
+        "backup_bytes": {
+          "insertion": 320,
+          "reuse": 0,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": 13,
+          "cpu": 13,
+          "nvme": 0
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "a": [
+            "nvme"
+          ],
+          "b": [
+            "nvme"
+          ],
+          "c": [
+            "nvme"
+          ],
+          "d": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ],
+          "e": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ]
+        }
+      },
+      "gpu-selective": {
+        "nvme_read_bytes": 0,
+        "nvme_write_bytes": 128,
+        "hit_tiers": [
+          null,
+          null,
+          null,
+          "gpu",
+          "gpu",
+          null,
+          null,
+          null,
+          "gpu",
+          "gpu"
+        ],
+        "tier_hits": {
+          "miss": 6,
+          "gpu": 4
+        },
+        "cache_misses": 6,
+        "tier_probe_misses": {
+          "gpu": 6,
+          "cpu": 6,
+          "nvme": 6
+        },
+        "eviction_io_bytes": 0,
+        "replication_bytes": 128,
+        "promotion_nvme_cpu_bytes": 0,
+        "promotion_cpu_gpu_bytes": 0,
+        "backup_bytes": {
+          "insertion": 0,
+          "reuse": 128,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": 3,
+          "cpu": 0,
+          "nvme": 0
+        },
+        "discarded_unbacked_entries": 3,
+        "replicas": {
+          "d": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ],
+          "e": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ]
+        }
+      },
+      "gpu-write-back": {
+        "nvme_read_bytes": 640,
+        "nvme_write_bytes": 320,
+        "hit_tiers": [
+          "nvme",
+          "nvme",
+          "nvme",
+          "nvme",
+          "nvme",
+          "nvme",
+          "nvme",
+          "nvme",
+          "nvme",
+          "nvme"
+        ],
+        "tier_hits": {
+          "nvme": 10
+        },
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": 10,
+          "cpu": 10,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 1280,
+        "replication_bytes": 320,
+        "promotion_nvme_cpu_bytes": 640,
+        "promotion_cpu_gpu_bytes": 640,
+        "backup_bytes": {
+          "insertion": 0,
+          "reuse": 0,
+          "eviction": 320
+        },
+        "tier_evictions": {
+          "gpu": 13,
+          "cpu": 13,
+          "nvme": 0
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "a": [
+            "nvme"
+          ],
+          "b": [
+            "nvme"
+          ],
+          "c": [
+            "nvme"
+          ],
+          "d": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ],
+          "e": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ]
+        }
+      }
+    }
+  },
+  "prefix_replay": {
+    "chunk_size": 4,
+    "namespace": "model/default",
+    "policies": {
+      "waterfall": {
+        "reused_tokens_per_request": [
+          0,
+          8,
+          4,
+          0,
+          8,
+          8
+        ],
+        "requests": 6,
+        "prompt_tokens": 48,
+        "reused_tokens": 28,
+        "computed_tokens": 20,
+        "uncached_tail_tokens": 0,
+        "store_failures": 0,
+        "prefix_gpu_hits": 3,
+        "prefix_cpu_hits": 2,
+        "prefix_nvme_hits": 2,
+        "nvme_read_bytes": 128,
+        "nvme_write_bytes": 64,
+        "hit_tiers": [],
+        "tier_hits": {},
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": null,
+          "cpu": null,
+          "nvme": null
+        },
+        "eviction_io_bytes": null,
+        "replication_bytes": 0,
+        "promotion_nvme_cpu_bytes": 0,
+        "promotion_cpu_gpu_bytes": 0,
+        "backup_bytes": {
+          "insertion": 0,
+          "reuse": 0,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": null,
+          "cpu": null,
+          "nvme": null
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "192f65e2a21d09e9f8bed574fe7984b9fdc9350e5a22aef82b1add09646bef5a": [
+            "gpu"
+          ],
+          "9c6cff00bf3eb480a07002241a28e1dda1ccf7091706ffcc41f0575c303f4ff3": [
+            "cpu"
+          ],
+          "cfc21b2d6b54126d41514d742c0629af65bbd0f75fd55f4ec65282691aad21c4": [
+            "gpu"
+          ],
+          "dc3fe88f5d891caa731ca4699eedc0fe63af74b33891b09cf6dacee63b3bac11": [
+            "cpu"
+          ],
+          "dd08e81156ade4a864f50bf43e36ed2e97a202cda18d86014bb9d8363100dbbc": [
+            "nvme"
+          ]
+        }
+      },
+      "cascade": {
+        "reused_tokens_per_request": [
+          0,
+          8,
+          4,
+          0,
+          8,
+          8
+        ],
+        "requests": 6,
+        "prompt_tokens": 48,
+        "reused_tokens": 28,
+        "computed_tokens": 20,
+        "uncached_tail_tokens": 0,
+        "store_failures": 0,
+        "prefix_gpu_hits": 5,
+        "prefix_cpu_hits": 0,
+        "prefix_nvme_hits": 2,
+        "nvme_read_bytes": 128,
+        "nvme_write_bytes": 320,
+        "hit_tiers": [],
+        "tier_hits": {},
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": 2,
+          "cpu": 2,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 0,
+        "replication_bytes": 320,
+        "promotion_nvme_cpu_bytes": 128,
+        "promotion_cpu_gpu_bytes": 128,
+        "backup_bytes": {
+          "insertion": 0,
+          "reuse": 0,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": 5,
+          "cpu": 5,
+          "nvme": 0
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "192f65e2a21d09e9f8bed574fe7984b9fdc9350e5a22aef82b1add09646bef5a": [
+            "nvme"
+          ],
+          "9c6cff00bf3eb480a07002241a28e1dda1ccf7091706ffcc41f0575c303f4ff3": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ],
+          "cfc21b2d6b54126d41514d742c0629af65bbd0f75fd55f4ec65282691aad21c4": [
+            "nvme"
+          ],
+          "dc3fe88f5d891caa731ca4699eedc0fe63af74b33891b09cf6dacee63b3bac11": [
+            "nvme"
+          ],
+          "dd08e81156ade4a864f50bf43e36ed2e97a202cda18d86014bb9d8363100dbbc": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ]
+        }
+      },
+      "gpu-write-through": {
+        "reused_tokens_per_request": [
+          0,
+          8,
+          4,
+          0,
+          8,
+          8
+        ],
+        "requests": 6,
+        "prompt_tokens": 48,
+        "reused_tokens": 28,
+        "computed_tokens": 20,
+        "uncached_tail_tokens": 0,
+        "store_failures": 0,
+        "prefix_gpu_hits": 5,
+        "prefix_cpu_hits": 0,
+        "prefix_nvme_hits": 2,
+        "nvme_read_bytes": 128,
+        "nvme_write_bytes": 320,
+        "hit_tiers": [],
+        "tier_hits": {},
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": 2,
+          "cpu": 2,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 0,
+        "replication_bytes": 320,
+        "promotion_nvme_cpu_bytes": 128,
+        "promotion_cpu_gpu_bytes": 128,
+        "backup_bytes": {
+          "insertion": 320,
+          "reuse": 0,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": 5,
+          "cpu": 5,
+          "nvme": 0
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "192f65e2a21d09e9f8bed574fe7984b9fdc9350e5a22aef82b1add09646bef5a": [
+            "nvme"
+          ],
+          "9c6cff00bf3eb480a07002241a28e1dda1ccf7091706ffcc41f0575c303f4ff3": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ],
+          "cfc21b2d6b54126d41514d742c0629af65bbd0f75fd55f4ec65282691aad21c4": [
+            "nvme"
+          ],
+          "dc3fe88f5d891caa731ca4699eedc0fe63af74b33891b09cf6dacee63b3bac11": [
+            "nvme"
+          ],
+          "dd08e81156ade4a864f50bf43e36ed2e97a202cda18d86014bb9d8363100dbbc": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ]
+        }
+      },
+      "gpu-selective": {
+        "reused_tokens_per_request": [
+          0,
+          8,
+          4,
+          0,
+          8,
+          8
+        ],
+        "requests": 6,
+        "prompt_tokens": 48,
+        "reused_tokens": 28,
+        "computed_tokens": 20,
+        "uncached_tail_tokens": 0,
+        "store_failures": 0,
+        "prefix_gpu_hits": 5,
+        "prefix_cpu_hits": 2,
+        "prefix_nvme_hits": 0,
+        "nvme_read_bytes": 0,
+        "nvme_write_bytes": 128,
+        "hit_tiers": [],
+        "tier_hits": {},
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": 2,
+          "cpu": 0,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 0,
+        "replication_bytes": 128,
+        "promotion_nvme_cpu_bytes": 0,
+        "promotion_cpu_gpu_bytes": 128,
+        "backup_bytes": {
+          "insertion": 0,
+          "reuse": 128,
+          "eviction": 0
+        },
+        "tier_evictions": {
+          "gpu": 5,
+          "cpu": 0,
+          "nvme": 0
+        },
+        "discarded_unbacked_entries": 3,
+        "replicas": {
+          "9c6cff00bf3eb480a07002241a28e1dda1ccf7091706ffcc41f0575c303f4ff3": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ],
+          "dd08e81156ade4a864f50bf43e36ed2e97a202cda18d86014bb9d8363100dbbc": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ]
+        }
+      },
+      "gpu-write-back": {
+        "reused_tokens_per_request": [
+          0,
+          8,
+          4,
+          0,
+          8,
+          8
+        ],
+        "requests": 6,
+        "prompt_tokens": 48,
+        "reused_tokens": 28,
+        "computed_tokens": 20,
+        "uncached_tail_tokens": 0,
+        "store_failures": 0,
+        "prefix_gpu_hits": 5,
+        "prefix_cpu_hits": 1,
+        "prefix_nvme_hits": 1,
+        "nvme_read_bytes": 64,
+        "nvme_write_bytes": 320,
+        "hit_tiers": [],
+        "tier_hits": {},
+        "cache_misses": 0,
+        "tier_probe_misses": {
+          "gpu": 2,
+          "cpu": 1,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 1280,
+        "replication_bytes": 320,
+        "promotion_nvme_cpu_bytes": 64,
+        "promotion_cpu_gpu_bytes": 128,
+        "backup_bytes": {
+          "insertion": 0,
+          "reuse": 0,
+          "eviction": 320
+        },
+        "tier_evictions": {
+          "gpu": 5,
+          "cpu": 4,
+          "nvme": 0
+        },
+        "discarded_unbacked_entries": 0,
+        "replicas": {
+          "192f65e2a21d09e9f8bed574fe7984b9fdc9350e5a22aef82b1add09646bef5a": [
+            "cpu",
+            "nvme"
+          ],
+          "9c6cff00bf3eb480a07002241a28e1dda1ccf7091706ffcc41f0575c303f4ff3": [
+            "gpu",
+            "nvme"
+          ],
+          "cfc21b2d6b54126d41514d742c0629af65bbd0f75fd55f4ec65282691aad21c4": [
+            "nvme"
+          ],
+          "dc3fe88f5d891caa731ca4699eedc0fe63af74b33891b09cf6dacee63b3bac11": [
+            "nvme"
+          ],
+          "dd08e81156ade4a864f50bf43e36ed2e97a202cda18d86014bb9d8363100dbbc": [
+            "cpu",
+            "gpu",
+            "nvme"
+          ]
+        }
+      }
+    }
+  },
+  "sglang_source_harness": {
+    "revision": "36b216e2ee7bae046a77a329e2fcda0e33beade5",
+    "sha256": "0dec99f54263e21cc75814fc648dc22f911c5ba81ed890bb27907c6d7f0cf6fb",
+    "methods": [
+      "_inc_hit_count_and_check",
+      "evict_device_leaf"
+    ],
+    "backup_decisions_match": true,
+    "decisions": {
+      "gpu-write-through": {
+        "backup_on_uses": [
+          true,
+          false,
+          false
+        ],
+        "unbacked_eviction": "discard"
+      },
+      "gpu-selective": {
+        "backup_on_uses": [
+          false,
+          true,
+          false
+        ],
+        "unbacked_eviction": "discard"
+      },
+      "gpu-write-back": {
+        "backup_on_uses": [
+          false,
+          false,
+          false
+        ],
+        "unbacked_eviction": "backup"
+      }
+    },
+    "limits": "Source methods with doubles; no radix dependencies, runtime GPU or async timing."
+  }
+}

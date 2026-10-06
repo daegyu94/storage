@@ -17,12 +17,13 @@ from mlpstorage_py.config import EXEC_TYPE, KVCACHE_MODELS
 
 
 @pytest.mark.parametrize('mode', ['open', 'whatif'])
-def test_tiering_policy_is_available_outside_closed(mode):
+@pytest.mark.parametrize('policy', ['cascade', 'gpu-write-through', 'gpu-selective', 'gpu-write-back'])
+def test_tiering_policy_is_available_outside_closed(mode, policy):
     parser = argparse.ArgumentParser()
     add_kvcache_arguments(parser, mode)
     base = ['run', '--results-dir', '/tmp', '--systemname', 'sys-v1']
     assert parser.parse_args(base).tiering_policy is None
-    assert parser.parse_args(base + ['--tiering-policy', 'cascade']).tiering_policy == 'cascade'
+    assert parser.parse_args(base + ['--tiering-policy', policy]).tiering_policy == policy
 
 
 def test_closed_rejects_tiering_override():
