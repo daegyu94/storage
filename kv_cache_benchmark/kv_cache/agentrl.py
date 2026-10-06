@@ -553,6 +553,35 @@ class SyncLifecycle:
     def io_completed(self, identity):
         pass
 
+    async def drain_offloads(self, reason):
+        async def drain(owner, pool):
+            tiers = pool.tiers
+            identity = {"owner": f"rollout-{owner}", "policy": self.version, "reason": reason}
+            self.trace.emit("offload_drain_begin", **identity, pending_stores=len(tiers.pending))
+            success = False
+            try:
+                await tiers.drain()
+                success = True
+            finally:
+                self.trace.emit("offload_drain_end", **identity, success=success, pending_stores=len(tiers.pending))
+
+        owners = [
+            (owner, pool)
+            for owner, pool in self.cache_pools.items()
+            if pool.tiers is not None and pool.tiers.settings.fs_execution == "background"
+        ]
+        if not owners:
+            return
+        pending = asyncio.gather(*(drain(owner, pool) for owner, pool in owners), return_exceptions=True)
+        try:
+            outcomes = await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            await pending
+            raise
+        for result in outcomes:
+            if isinstance(result, BaseException):
+                raise result
+
     async def io(
         self,
         backend,
@@ -864,9 +893,13 @@ class SyncLifecycle:
                 await self.rollout(request, semaphore)
 
         # TaskGroup drains/cancels peers on failure before the rank exchanges errors.
-        async with asyncio.TaskGroup() as group:
-            for _ in range(min(self.config.concurrency, self.config.requests_per_rank)):
-                group.create_task(worker())
+        try:
+            async with asyncio.TaskGroup() as group:
+                for _ in range(min(self.config.concurrency, self.config.requests_per_rank)):
+                    group.create_task(worker())
+        finally:
+            # Sync closes this event loop before entering a collective phase.
+            await self.drain_offloads("rollout_end")
         self.trace.emit("rollout_phase_end", policy=self.version)
 
     @staticmethod

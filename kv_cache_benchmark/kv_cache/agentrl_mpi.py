@@ -235,12 +235,17 @@ class RolloutEngine(RoleEngine):
         self.decode_locks = [asyncio.Lock() for _ in self.owners]
         self.dispatches, self.stopped = set(), asyncio.Event()
         self.event("rollout_phase_begin", policy=self.version)
-        async with asyncio.TaskGroup() as jobs:
-            self.jobs = jobs
-            self.endpoint = Endpoint(comm, jobs, self.command, lambda peer, payload: None, self.settings.rpc_timeout_s)
-            jobs.create_task(self.endpoint.pump())
-            await self.stopped.wait()
-            await self.endpoint.finish()
+        try:
+            async with asyncio.TaskGroup() as jobs:
+                self.jobs = jobs
+                self.endpoint = Endpoint(
+                    comm, jobs, self.command, lambda peer, payload: None, self.settings.rpc_timeout_s
+                )
+                jobs.create_task(self.endpoint.pump())
+                await self.stopped.wait()
+                await self.endpoint.finish()
+        finally:
+            await self.drain_offloads("run_cleanup")
         self.event("rollout_phase_end", policy=self.version)
 
 

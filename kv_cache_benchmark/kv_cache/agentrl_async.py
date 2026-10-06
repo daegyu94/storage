@@ -556,6 +556,7 @@ class AsyncLifecycle(SyncLifecycle):
     async def pause(self, reason):
         self.event("rollout_pause_begin", reason=reason, policy=self.version)
         await self.gate.pause()
+        await self.drain_offloads(reason)
         for state in self.states.values():
             if state.record is None and state.kv_version is not None:
                 self.event("rollout_abort", state, generated_tokens=state.generated, reason=reason)
@@ -662,6 +663,7 @@ class AsyncLifecycle(SyncLifecycle):
                 for task in producers:
                     task.cancel()
                 await asyncio.gather(*producers, return_exceptions=True)
+                await self.drain_offloads("run_cleanup")
             for group in list(self.groups):
                 await self.dispose(group, "run_end")
             self.groups.clear()

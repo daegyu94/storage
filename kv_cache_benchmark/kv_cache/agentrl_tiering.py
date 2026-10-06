@@ -1,10 +1,12 @@
 """Completed-block CPU staging with real, logically unbounded FS cascade.
 
 CPU reservation is metadata only. This does not emulate DMA or vLLM's
-scheduler-step transfer pipeline; callers await cascade/promotion completion.
+scheduler-step transfer pipeline. Background cascade is an opt-in model;
+CPU slots remain pinned and full staging skips new stores without blocking.
 """
 
 import asyncio
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, fields
 
@@ -15,6 +17,8 @@ class TierSettings:
     fs_enabled: bool = True
     fs_capacity_bytes: None = None
     offload_prompt_only: bool = True
+    fs_execution: str = "caller_await"
+    fs_write_workers: int = 16
 
     @classmethod
     def parse(cls, values):
@@ -30,6 +34,10 @@ class TierSettings:
             raise ValueError("tier fs_enabled/offload_prompt_only must be boolean")
         if result.fs_capacity_bytes is not None:
             raise ValueError("tier FS capacity must be null (logically unbounded)")
+        if result.fs_execution not in ("caller_await", "background"):
+            raise ValueError("tier FS execution must be caller_await or background")
+        if type(result.fs_write_workers) is not int or result.fs_write_workers <= 0:
+            raise ValueError("tier FS write workers must be a positive integer")
         return result
 
     def validate(self, config):
@@ -58,8 +66,15 @@ class CPUPrimary:
         self.peak = self.fs_peak = 0
         self.hits = self.misses = self.evictions = self.promotions = self.stores = 0
         self.fs_reads = self.fs_writes = self.waits = 0
+        self.pending = {}
+        self.failure = None
+        self.write_slots = asyncio.Semaphore(settings.fs_write_workers)
+        self.pending_peak = self.write_active = self.write_active_peak = 0
+        self.store_skipped = self.failed_stores = 0
+        self.queue_wait_s = 0.0
+        self.store_sequence = 0
 
-    async def reserve(self, key, *, ready, context):
+    async def reserve(self, key, *, ready, context, wait=True):
         async with self.condition:
             waiting = False
             while True:
@@ -79,6 +94,8 @@ class CPUPrimary:
                         self.evictions += 1
                         self.emit("cpu_cache_evict", key=victim, bytes=self.page_bytes, **context)
                         continue
+                if not wait:
+                    return None, False
                 if not waiting:
                     self.waits += 1
                     waiting = True
@@ -101,6 +118,8 @@ class CPUPrimary:
             self.condition.notify_all()
 
     async def store(self, key, **context):
+        if self.settings.fs_execution == "background":
+            return await self.background_store(key, context)
         entry, created = await self.reserve(key, ready=True, context=context)
         if not created:
             return
@@ -119,7 +138,89 @@ class CPUPrimary:
         if cancelled:
             raise asyncio.CancelledError
 
+    def check_failure(self):
+        if self.failure is not None:
+            raise self.failure
+
+    async def background_store(self, key, context):
+        for completed_key, completed in list(self.pending.items()):
+            if completed.done():
+                self.pending.pop(completed_key)
+        self.check_failure()
+        entry, created = await self.reserve(key, ready=True, context=context, wait=False)
+        if entry is None:
+            self.store_skipped += 1
+            self.emit("cpu_store_skip", key=key, bytes=self.page_bytes, reason="pinned_capacity", **context)
+            return False
+        if not created:
+            return True
+        self.stores += 1
+        self.emit("cpu_store_ready", key=key, bytes=self.page_bytes, **context)
+        if not self.settings.fs_enabled or key in self.fs_keys:
+            await self.unpin(entry)
+            return True
+        sequence = self.store_sequence
+        self.store_sequence += 1
+        submitted = time.monotonic()
+        self.emit("fs_store_submit", key=key, store_id=sequence, bytes=self.page_bytes, **context)
+        task = asyncio.create_task(self.cascade(key, entry, sequence, submitted, context))
+        self.pending[key] = task
+        self.pending_peak = max(self.pending_peak, len(self.pending))
+
+        def settled(task):
+            if self.pending.get(key) is task:
+                self.pending.pop(key)
+            if not task.cancelled():
+                task.exception()  # The failure is latched for store/load/drain.
+
+        task.add_done_callback(settled)
+        return True
+
+    async def cascade(self, key, entry, sequence, submitted, context):
+        success = False
+        error_type = None
+        try:
+            async with self.write_slots:
+                waited = time.monotonic() - submitted
+                self.queue_wait_s += waited
+                self.write_active += 1
+                self.write_active_peak = max(self.write_active_peak, self.write_active)
+                self.emit("fs_store_begin", key=key, store_id=sequence, executor_wait_s=waited, **context)
+                try:
+                    cancelled = await self.transfer("write", key, context)
+                    self.fs_keys.add(key)
+                    self.fs_writes += 1
+                    self.fs_peak = max(self.fs_peak, len(self.fs_keys) * self.page_bytes)
+                    self.emit("fs_cascade_end", key=key, bytes=self.page_bytes, **context)
+                    success = True
+                    if cancelled:
+                        raise asyncio.CancelledError
+                finally:
+                    self.write_active -= 1
+        except BaseException as exc:
+            error_type = type(exc).__name__
+            self.failed_stores += not success
+            if self.failure is None:
+                self.failure = exc
+            raise
+        finally:
+            try:
+                self.emit("fs_store_end", key=key, store_id=sequence, success=success, error_type=error_type, **context)
+            finally:
+                await self.unpin(entry)
+
+    async def drain(self):
+        if self.pending:
+            jobs = asyncio.gather(*list(self.pending.values()), return_exceptions=True)
+            try:
+                await asyncio.shield(jobs)
+            except asyncio.CancelledError:
+                await jobs
+                raise
+        self.check_failure()
+
     async def load(self, key, **context):
+        self.check_failure()
         async with self.condition:
             while key in self.entries and not self.entries[key].ready:
                 await self.condition.wait()
@@ -156,12 +257,13 @@ class CPUPrimary:
         return True
 
     def invalidate(self):
-        if self.condition.locked() or any(e.pins for e in self.entries.values()):
+        if self.pending or self.condition.locked() or any(e.pins for e in self.entries.values()):
             raise ValueError("cannot invalidate active CPU transfers")
         self.emit("cpu_fs_logical_invalidate", cpu_keys=list(self.entries), fs_keys=sorted(self.fs_keys))
         self.entries.clear()
         self.fs_keys.clear()
         self.condition = asyncio.Condition()
+        self.write_slots = asyncio.Semaphore(self.settings.fs_write_workers)
 
     def summary(self):
         return {
@@ -175,6 +277,15 @@ class CPUPrimary:
             "cpu_promotions": self.promotions,
             "cpu_store_ops": self.stores,
             "cpu_wait_events": self.waits,
+            "cpu_store_skipped": self.store_skipped,
+            "cpu_store_skipped_payload_bytes": self.store_skipped * self.page_bytes,
+            "fs_execution": self.settings.fs_execution,
+            "fs_write_workers": self.settings.fs_write_workers,
+            "fs_pending_stores": len(self.pending),
+            "fs_pending_peak": self.pending_peak,
+            "fs_write_active_peak": self.write_active_peak,
+            "fs_executor_wait_s": self.queue_wait_s,
+            "fs_failed_stores": self.failed_stores,
             "fs_write_ops": self.fs_writes,
             "fs_write_payload_bytes": self.fs_writes * self.page_bytes,
             "fs_read_ops": self.fs_reads,

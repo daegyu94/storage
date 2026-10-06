@@ -15,7 +15,7 @@ from kv_cache.agentrl import AgentRLConfig
 from kv_cache.backends import NVMeBackend
 
 
-def tier(tmp_path, *, pages=1, fs=True, hold=None, fail=None):
+def tier(tmp_path, *, pages=1, fs=True, hold=None, fail=None, background=False, workers=16):
     from kv_cache.agentrl_tiering import CPUPrimary, TierSettings
 
     backend = NVMeBackend(str(tmp_path))
@@ -33,7 +33,10 @@ def tier(tmp_path, *, pages=1, fs=True, hold=None, fail=None):
             assert data.nbytes == size
         operations.append((op, key, size))
 
-    settings = TierSettings.parse({"cpu_capacity_bytes": pages * 32, "fs_enabled": fs})
+    values = {"cpu_capacity_bytes": pages * 32, "fs_enabled": fs}
+    if background:
+        values.update(fs_execution="background", fs_write_workers=workers)
+    settings = TierSettings.parse(values)
     cpu = CPUPrimary(settings, 32, io, lambda name, **data: events.append({"event": name, **data}))
     return cpu, backend, operations, events
 
@@ -411,3 +414,204 @@ def test_partial_policy_resume_refills_new_namespace_and_never_reads_invalidated
             and e["t_s"] > invalid["t_s"]
             for e in trace["events"]
         )
+
+
+def test_background_store_returns_with_cpu_ready_and_fs_pending(tmp_path):
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def hold(op, key):
+            started.set()
+            await release.wait()
+
+        cpu, backend, operations, events = tier(tmp_path, background=True, hold=hold)
+        assert await cpu.store("a") is True
+        await asyncio.wait_for(started.wait(), 1)
+        assert not operations and cpu.summary()["cpu_pinned_pages"] == 1
+        assert await cpu.load("a") and not cpu.fs_keys
+        with pytest.raises(ValueError, match="active"):
+            cpu.invalidate()
+        release.set()
+        await cpu.drain()
+        assert cpu.fs_keys == {"a"} and backend._get_path("a").exists()
+        assert cpu.summary()["cpu_pinned_pages"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_background_full_staging_drops_store_without_blocking_generation(tmp_path):
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def hold(op, key):
+            started.set()
+            await release.wait()
+
+        cpu, _, operations, _ = tier(tmp_path, background=True, hold=hold)
+        await cpu.store("a")
+        await started.wait()
+        assert await asyncio.wait_for(cpu.store("b"), 0.1) is False
+        assert not await cpu.load("b")
+        assert cpu.summary()["cpu_store_skipped"] == 1 and not operations
+        release.set()
+        await cpu.drain()
+        assert cpu.fs_keys == {"a"}
+
+    asyncio.run(scenario())
+
+
+def test_background_backlog_is_bounded_by_cpu_pages_and_workers(tmp_path):
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def hold(op, key):
+            started.set()
+            await release.wait()
+
+        cpu, _, operations, _ = tier(tmp_path, pages=2, background=True, workers=1, hold=hold)
+        for index in range(10):
+            await cpu.store(str(index))
+        await started.wait()
+        stats = cpu.summary()
+        assert stats["fs_pending_stores"] == stats["fs_pending_peak"] == 2
+        assert stats["fs_write_active_peak"] == 1 and stats["cpu_store_skipped"] == 8
+        assert stats["cpu_reserved_bytes"] == 64
+        release.set()
+        await cpu.drain()
+        assert len(operations) == 2 and cpu.summary()["fs_pending_stores"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_background_duplicate_store_reuses_one_pending_copy(tmp_path):
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def hold(op, key):
+            started.set()
+            await release.wait()
+
+        cpu, _, operations, _ = tier(tmp_path, background=True, hold=hold)
+        await cpu.store("a")
+        await started.wait()
+        await cpu.store("a")
+        assert cpu.summary()["fs_pending_stores"] == 1
+        release.set()
+        await cpu.drain()
+        assert operations == [("write", "a", 32)]
+
+    asyncio.run(scenario())
+
+
+def test_background_failure_is_observed_at_drain_without_false_fs_hit(tmp_path):
+    async def scenario():
+        cpu, _, _, events = tier(tmp_path, background=True, fail="write")
+        await cpu.store("a")
+        with pytest.raises(OSError, match="secondary"):
+            await cpu.drain()
+        assert not cpu.fs_keys and cpu.summary()["cpu_pinned_pages"] == 0
+        assert cpu.summary()["fs_pending_stores"] == 0
+        assert [e["success"] for e in events if e["event"] == "fs_store_end"] == [False]
+
+    asyncio.run(scenario())
+
+
+def test_background_cancelled_drain_waits_for_real_io_and_unpin(tmp_path):
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def hold(op, key):
+            started.set()
+            await release.wait()
+
+        cpu, _, operations, _ = tier(tmp_path, background=True, hold=hold)
+        await cpu.store("a")
+        await started.wait()
+        drain = asyncio.create_task(cpu.drain())
+        await asyncio.sleep(0)
+        drain.cancel()
+        await asyncio.sleep(0.005)
+        assert not drain.done() and cpu.summary()["cpu_pinned_pages"] == 1
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await drain
+        assert operations == [("write", "a", 32)] and cpu.summary()["cpu_pinned_pages"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_background_cpu_only_has_no_tasks_or_files(tmp_path):
+    async def scenario():
+        cpu, _, operations, _ = tier(tmp_path, background=True, fs=False)
+        await cpu.store("a")
+        await cpu.store("b")
+        await cpu.drain()
+        assert not operations and not cpu.fs_keys
+        assert cpu.summary()["fs_pending_peak"] == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "field,value", [("fs_execution", "unknown"), ("fs_write_workers", 0), ("fs_write_workers", True)]
+)
+def test_background_settings_reject_invalid_scheduler_configuration(field, value):
+    from kv_cache.agentrl_tiering import TierSettings
+
+    with pytest.raises(ValueError):
+        TierSettings.parse({"cpu_capacity_bytes": 32, field: value})
+
+
+@pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
+def test_background_fs_outlives_request_but_is_drained_before_next_policy(tmp_path, mode):
+    import time
+
+    from kv_cache.agentrl_trace import analyze_trace
+
+    class Slow(NVMeBackend):
+        def write(self, key, data):
+            if self.base_path.name == "kv":
+                time.sleep(0.02)
+            return super().write(key, data)
+
+    raw = asdict(config(mode, fs_execution="background", fs_write_workers=1, cpu_capacity_bytes=64 * 1024))
+    raw.update(
+        iterations=1,
+        requests_per_rank=2,
+        concurrency=2,
+        prompt_tokens=4,
+        response_tokens=[2],
+        turns=1,
+        observation_tokens=0,
+        prefix_reuse_probability=0,
+    )
+    if mode != "sync":
+        raw["async_workload"].update(group_size=1, batch_groups=1, outstanding_groups=2, queue_capacity=1)
+    summary, trace, runner = execute(tmp_path, AgentRLConfig.from_dict(raw), backend_factory=Slow)
+    completed = {e["request"]: e["t_s"] for e in trace["events"] if e["event"] == "rollout_complete"}
+    writes = [e for e in trace["events"] if e["event"] == "io_end" and e["kind"] == "kv" and e["op"] == "write"]
+    assert any(e["request"] in completed and e["t_s"] > completed[e["request"]] for e in writes)
+    assert any(e["event"] == "offload_drain_end" for e in trace["events"])
+    installed = next(e["t_s"] for e in trace["events"] if e["event"] == "policy_install" and e["policy"] == 1)
+    assert all(e["t_s"] < installed for e in writes if e["policy"] == 0)
+    assert not analyze_trace(trace)["violations"]
+    for pool in runner.cache_pools.values():
+        assert pool.tiers.summary()["fs_pending_stores"] == pool.tiers.summary()["cpu_pinned_pages"] == 0
+    assert summary["fidelity"] == "uncalibrated"
+
+
+def test_background_secondary_failure_aborts_sync_before_policy_install(tmp_path):
+    class Broken(NVMeBackend):
+        def write(self, key, data):
+            if self.base_path.name == "kv":
+                raise OSError("background secondary failure")
+            return super().write(key, data)
+
+    from kv_cache.agentrl import create_lifecycle
+
+    runner = create_lifecycle(
+        config(fs_execution="background"), tmp_path / "data", tmp_path / "results", backend_factory=Broken
+    )
+    with pytest.raises(RuntimeError, match="secondary"):
+        runner.run()
+    assert not any(e["event"] == "policy_install" and e["policy"] > 0 for e in runner.trace.events)

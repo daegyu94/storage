@@ -471,6 +471,37 @@ Legacy cache `offload_ops/reload_ops` count only the dirty-eviction path; use ti
 FS valid bytes exclude retired copies pending GC; existing physical KV metrics track those files.
 
 Normalized traces include resolved `kv_offload_tiers` and `tier: fs` on actual KV I/O.
-Callers await FS completion while other requests can overlap compute/I/O.
+By default callers await FS completion while other requests can overlap compute/I/O.
+The optional background path below changes store admission and request overlap.
 Native vLLM asynchronous scheduler-step DMA/cascade, per-TP files, padded layouts and connector reset behavior remain uncalibrated.
 This extension does not start Ray/vLLM or certify native fidelity.
+
+### Background FS admission and drain
+
+These fields extend an otherwise valid `kv_offload_tiers` config:
+
+```yaml
+kv_offload_tiers:
+  cpu_capacity_bytes: 67108864
+  fs_enabled: true
+  fs_capacity_bytes: null
+  offload_prompt_only: true
+  fs_execution: background
+  fs_write_workers: 4
+```
+
+The default `fs_execution: caller_await` preserves the existing path.
+Opt-in `background` returns after CPU staging admission and performs real FS writes concurrently, with at most `fs_write_workers` active writes per owner.
+CPU slots stay pinned until completion, and full pinned staging skips new stores instead of forcing every generation to wait.
+Backlog is bounded by CPU page count, and a CPU hit may serve a block while its FS write is pending.
+Missing copies follow the existing cache miss/re-prefill path; reads/promotions still await storage.
+
+Sync drains at rollout end; colocated async drains after pausing for training; separated async allows writes to overlap training/checkpoint and drains before policy installation.
+All modes drain on cleanup before invalidating old-policy metadata and doing physical GC.
+Failed writes cannot become valid FS hits, and background errors propagate through local or MPI failure handling.
+Trace events include `cpu_store_skip`, `fs_store_submit/begin/end` and `offload_drain_begin/end`.
+Owner summaries expose skipped payloads, pending/active peaks, executor wait and failed-store counts.
+
+This admission/pinning model follows the vLLM v0.29 CPU manager contract but does not reproduce DMA, scheduler-step batch admission, native priority pools or newer latency-based proportional throttling.
+Policy invalidation and physical GC remain conservative: native secondary FS retention/cache namespaces require further trace validation.
+All results remain `uncalibrated`.

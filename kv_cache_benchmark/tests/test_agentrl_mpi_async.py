@@ -190,13 +190,20 @@ def test_trace_detects_changed_storage_context_between_arrival_and_completion(tm
     assert any("I/O identity mismatch" in v for v in analyze_trace(trace)["violations"])
 
 
+@pytest.mark.parametrize("background", [False, True])
 @pytest.mark.parametrize("target", ["worker_kv", "worker_gc", "trainer_checkpoint", "trainer_trajectory", "unshared"])
-def test_mpi_role_failure_never_hangs_or_publishes_complete_summary(tmp_path, target):
+def test_mpi_role_failure_never_hangs_or_publishes_complete_summary(tmp_path, target, background):
     if not shutil.which("mpiexec"):
         pytest.skip("mpiexec unavailable")
     pytest.importorskip("mpi4py")
     config_path = tmp_path / "config.json"
-    config_path.write_text(json.dumps(asdict(config_for_mpi())))
+    raw = asdict(config_for_mpi())
+    if background:
+        from test_agentrl_tiering import config as tiered
+
+        raw = asdict(tiered("separate_async", fs_execution="background", fs_write_workers=1))
+        raw["async_workload"].update(execution="mpi_shared", rollout_owners=2)
+    config_path.write_text(json.dumps(raw))
     helper = tmp_path / "role_failure.py"
     helper.write_text("""
 import json, sys
@@ -257,3 +264,57 @@ except Exception as exc:
     assert process.returncode != 0
     assert "injected" in process.stderr if target != "unshared" else "shared visibility" in process.stderr
     assert not list((tmp_path / "results").glob("*/summary.json"))
+
+
+def test_mpi_rollout_failure_drains_owned_offloads_before_event_loop_closes(tmp_path, monkeypatch):
+    import kv_cache.agentrl_mpi as module
+
+    engine = RolloutEngine(config_for_mpi(), tmp_path / "data", tmp_path / "results")
+    engine.owners = [{}, {}]
+    drained = []
+
+    async def drain(reason):
+        drained.append(reason)
+
+    engine.drain_offloads = drain
+
+    class FailingEndpoint:
+        def __init__(self, *args):
+            pass
+
+        async def pump(self):
+            raise OSError("injected control failure")
+
+    monkeypatch.setattr(module, "Endpoint", FailingEndpoint)
+    with pytest.raises(Exception, match="unhandled errors"):
+        asyncio.run(engine.execute(object()))
+    assert drained == ["run_cleanup"]
+
+
+def test_background_cascade_runs_on_separate_mpi_owners_and_drains_before_install(tmp_path):
+    from test_agentrl_tiering import config as tiered
+
+    raw = asdict(tiered("separate_async", fs_execution="background", fs_write_workers=1))
+    raw["async_workload"].update(execution="mpi_shared", rollout_owners=2)
+    from kv_cache.agentrl import AgentRLConfig
+
+    summary, trace, _ = run_mpi(tmp_path, AgentRLConfig.from_dict(raw))
+    assert summary["world_size"] == 3 and not analyze_trace(trace)["violations"]
+    for rank in (1, 2):
+        events = [e for e in trace["events"] if e["rank"] == rank]
+        assert any(e["event"] == "fs_store_submit" for e in events)
+        assert any(e["event"] == "offload_drain_end" for e in events)
+        for install in [e for e in events if e["event"] == "policy_install" and e["policy"] > 0]:
+            assert not any(
+                e["event"] == "io_end"
+                and e["kind"] == "kv"
+                and e["op"] == "write"
+                and e["policy"] < install["policy"]
+                and e["t_s"] > install["t_s"]
+                for e in events
+            )
+    assert all(
+        p["offload_tiers"]["fs_pending_stores"] == 0 and p["offload_tiers"]["cpu_pinned_pages"] == 0
+        for rank in summary["ranks"]
+        for p in rank.get("kv_cache_model", {}).get("owners", {}).values()
+    )
