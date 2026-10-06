@@ -2,7 +2,7 @@
 Core multi-tier cache engine for KV Cache Benchmark.
 
 Contains KVCacheGenerator (data generation with pre-allocated buffers)
-and MultiTierCache (3-tier LRU cache with waterfall eviction).
+and MultiTierCache (waterfall eviction or optional replicated cascade offload).
 """
 
 import os
@@ -218,7 +218,15 @@ class MultiTierCache:
                  max_concurrent_allocs: int = 0,
                  storage_capacity_gb: float = 0,
                  tensor_parallel: int = 1,
-                 io_tracer: Optional['IOTracer'] = None):
+                 io_tracer: Optional['IOTracer'] = None,
+                 tiering_policy: str = 'waterfall'):
+
+        if tiering_policy not in ('waterfall', 'cascade'):
+            raise ValueError(f'Unknown tiering policy: {tiering_policy}')
+        if tiering_policy == 'cascade' and cpu_memory_gb <= 0:
+            raise ValueError('cascade requires a positive CPU primary capacity')
+        self.tiering_policy = tiering_policy
+        self._cascade = None
 
         self.model_config = model_config
         self.gpu_memory_limit = gpu_memory_gb * 1024**3
@@ -251,7 +259,8 @@ class MultiTierCache:
             self.backends['cpu'] = CPUMemoryBackend()
             self.backends['nvme'] = NVMeBackend(base_path=cache_dir)
 
-        self.generator = KVCacheGenerator(model_config, global_seed=self.seed)
+        self.generator = (None if tiering_policy == 'cascade' and io_tracer is not None
+                          else KVCacheGenerator(model_config, global_seed=self.seed))
 
         self.cache_entries = {}
         self.entry_locks: Dict[str, threading.Lock] = {}
@@ -304,6 +313,10 @@ class MultiTierCache:
             'storage_tokens_processed': 0,
         }
 
+        if tiering_policy == 'cascade':
+            from kv_cache.cascade import CascadePolicy
+            self._cascade = CascadePolicy(self)
+
     def _get_entry_lock(self, key: str) -> threading.Lock:
         """Get or create a lock for a specific cache entry."""
         with self.metadata_lock:
@@ -313,6 +326,9 @@ class MultiTierCache:
 
     def _handle_gpu_eviction(self, key: str, tier: str, evicted_size: int) -> None:
         """Callback invoked by GPUMemoryBackend when it evicts entries during OOM handling."""
+        if self._cascade is not None:
+            self._cascade.gpu_evicted(key)
+            return
         with self.metadata_lock:
             if key in self.cache_entries:
                 del self.cache_entries[key]
@@ -649,6 +665,8 @@ class MultiTierCache:
 
     def allocate_cache(self, key: str, num_tokens: int, phase: InferencePhase = InferencePhase.PREFILL) -> Tuple[bool, str, float]:
         """Allocates and writes a new KV cache entry to the most appropriate tier."""
+        if self._cascade is not None:
+            return self._cascade.allocate(key, num_tokens, phase)
         with self.metadata_lock:
             if key in self.cache_entries:
                 return True, self.cache_entries[key]['location'], 0.0
@@ -763,6 +781,8 @@ class MultiTierCache:
         Returns:
             (location, size_bytes) if the entry exists, (None, 0) otherwise.
         """
+        if self._cascade is not None:
+            return self._cascade.exists(key)
         with self.metadata_lock:
             entry = self.cache_entries.get(key)
             if entry is None:
@@ -772,6 +792,8 @@ class MultiTierCache:
     def access_cache(self, key: str, phase: InferencePhase = InferencePhase.DECODE,
                      cache_type: str = 'user') -> Tuple[Optional[str], float]:
         """Accesses an existing cached entry and records the read performance."""
+        if self._cascade is not None:
+            return self._cascade.access(key, phase, cache_type)
         with self.metadata_lock:
             if key not in self.cache_entries:
                 with self.stats_lock:
@@ -938,6 +960,11 @@ class MultiTierCache:
 
     def get_stats(self, duration: float) -> Dict:
         """Gathers and returns a comprehensive dictionary of all performance statistics."""
+        if self._cascade is not None:
+            return self._cascade.get_stats(duration)
+        return self._get_stats_inner(duration)
+
+    def _get_stats_inner(self, duration: float) -> Dict:
         with self.stats_lock:
             total_accesses = self.stats['cache_hits'] + self.stats['cache_misses']
             hit_rate = self.stats['cache_hits'] / total_accesses if total_accesses > 0 else 0
@@ -1038,6 +1065,12 @@ class MultiTierCache:
 
     def reset_stats(self):
         """Reset all performance counters (used after preconditioning)."""
+        if self._cascade is not None:
+            self._cascade.reset_stats()
+            return
+        self._reset_stats_inner()
+
+    def _reset_stats_inner(self):
         with self.stats_lock:
             for key, value in self.stats.items():
                 if isinstance(value, list):

@@ -27,6 +27,7 @@ class ConfigLoader:
 
     # Define the valid configuration schema with expected types
     VALID_SCHEMA = {
+        'tiering': {'policy': str},
         'model_configs': ...,  # Dynamic keys (model names) with nested model properties
         'user_templates': {
             'chatbot': {'context_range': list, 'generation_range': list, 'think_time_range': list},
@@ -140,6 +141,10 @@ class ConfigLoader:
 
         # Validate all keys against schema
         self._validate_keys(self.config, self.VALID_SCHEMA, path_prefix='')
+
+        policy = self.get('tiering', 'policy', default='waterfall')
+        if policy not in ('waterfall', 'cascade'):
+            raise ValueError(f'Unknown tiering policy: {policy}')
 
         logger.info(f"Loaded configuration from {config_path}")
 

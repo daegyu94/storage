@@ -81,7 +81,8 @@ class IntegratedBenchmark:
                  prefill_only: bool = False,
                  decode_only: bool = False,
                  io_trace_log: Optional[str] = None,
-                 enable_latency_tracing: bool = False):
+                 enable_latency_tracing: bool = False,
+                 tiering_policy: str = 'waterfall'):
 
         self.model_config = model_config
         self.num_users = num_users
@@ -151,6 +152,7 @@ class IntegratedBenchmark:
             storage_capacity_gb=storage_capacity_gb,
             tensor_parallel=self.tensor_parallel,
             io_tracer=self.io_tracer,
+            tiering_policy=tiering_policy,
         )
         self.conversation_manager = ConversationManager()
         self.prefix_cache_manager = PrefixCacheManager(self.cache) if enable_prefix_caching else None

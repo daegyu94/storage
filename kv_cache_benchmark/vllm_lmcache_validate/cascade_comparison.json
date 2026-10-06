@@ -1,0 +1,476 @@
+{
+  "object_bytes": 64,
+  "cpu_capacity_bytes": 160,
+  "scope": "logical payload I/O; synchronous completed operations; no inference timing",
+  "scenarios": {
+    "hot_fit": {
+      "operations": [
+        [
+          "put",
+          "a"
+        ],
+        [
+          "put",
+          "b"
+        ],
+        [
+          "get",
+          "a"
+        ],
+        [
+          "get",
+          "a"
+        ],
+        [
+          "get",
+          "a"
+        ]
+      ],
+      "disk_capacity_bytes": 512,
+      "waterfall": {
+        "nvme_read_bytes": 0,
+        "nvme_write_bytes": 0,
+        "hit_tiers": [
+          "cpu",
+          "cpu",
+          "cpu"
+        ],
+        "tier_hits": {
+          "cpu": 3
+        },
+        "tier_misses": {
+          "cpu": 0,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 0,
+        "promotion_bytes": 0,
+        "replication_bytes": 0,
+        "tier_evictions": {
+          "cpu": 0,
+          "nvme": 0
+        },
+        "cache_misses": 0
+      },
+      "cascade": {
+        "nvme_read_bytes": 0,
+        "nvme_write_bytes": 128,
+        "hit_tiers": [
+          "cpu",
+          "cpu",
+          "cpu"
+        ],
+        "tier_hits": {
+          "cpu": 3
+        },
+        "tier_misses": {
+          "cpu": 0,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 0,
+        "promotion_bytes": 0,
+        "replication_bytes": 128,
+        "tier_evictions": {
+          "cpu": 0,
+          "nvme": 0
+        },
+        "cache_misses": 0
+      },
+      "lmcache_source_match": true,
+      "lmcache_disk_io": [
+        [
+          "Write",
+          "a",
+          64
+        ],
+        [
+          "Write",
+          "b",
+          64
+        ]
+      ]
+    },
+    "reused_cold": {
+      "operations": [
+        [
+          "put",
+          "a"
+        ],
+        [
+          "put",
+          "b"
+        ],
+        [
+          "put",
+          "c"
+        ],
+        [
+          "get",
+          "a"
+        ],
+        [
+          "get",
+          "a"
+        ],
+        [
+          "get",
+          "a"
+        ]
+      ],
+      "disk_capacity_bytes": 512,
+      "waterfall": {
+        "nvme_read_bytes": 192,
+        "nvme_write_bytes": 64,
+        "hit_tiers": [
+          "nvme",
+          "nvme",
+          "nvme"
+        ],
+        "tier_hits": {
+          "nvme": 3
+        },
+        "tier_misses": {
+          "cpu": 3,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 128,
+        "promotion_bytes": 0,
+        "replication_bytes": 0,
+        "tier_evictions": {
+          "cpu": 1,
+          "nvme": 0
+        },
+        "cache_misses": 0
+      },
+      "cascade": {
+        "nvme_read_bytes": 64,
+        "nvme_write_bytes": 192,
+        "hit_tiers": [
+          "nvme",
+          "cpu",
+          "cpu"
+        ],
+        "tier_hits": {
+          "nvme": 1,
+          "cpu": 2
+        },
+        "tier_misses": {
+          "cpu": 1,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 0,
+        "promotion_bytes": 64,
+        "replication_bytes": 192,
+        "tier_evictions": {
+          "cpu": 2,
+          "nvme": 0
+        },
+        "cache_misses": 0
+      },
+      "lmcache_source_match": true,
+      "lmcache_disk_io": [
+        [
+          "Write",
+          "a",
+          64
+        ],
+        [
+          "Write",
+          "b",
+          64
+        ],
+        [
+          "Write",
+          "c",
+          64
+        ],
+        [
+          "Read",
+          "a",
+          64
+        ]
+      ]
+    },
+    "thrashing": {
+      "operations": [
+        [
+          "put",
+          "a"
+        ],
+        [
+          "put",
+          "b"
+        ],
+        [
+          "put",
+          "c"
+        ],
+        [
+          "get",
+          "a"
+        ],
+        [
+          "get",
+          "b"
+        ],
+        [
+          "get",
+          "c"
+        ],
+        [
+          "get",
+          "a"
+        ],
+        [
+          "get",
+          "b"
+        ],
+        [
+          "get",
+          "c"
+        ]
+      ],
+      "disk_capacity_bytes": 512,
+      "waterfall": {
+        "nvme_read_bytes": 128,
+        "nvme_write_bytes": 64,
+        "hit_tiers": [
+          "nvme",
+          "cpu",
+          "cpu",
+          "nvme",
+          "cpu",
+          "cpu"
+        ],
+        "tier_hits": {
+          "nvme": 2,
+          "cpu": 4
+        },
+        "tier_misses": {
+          "cpu": 2,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 128,
+        "promotion_bytes": 0,
+        "replication_bytes": 0,
+        "tier_evictions": {
+          "cpu": 1,
+          "nvme": 0
+        },
+        "cache_misses": 0
+      },
+      "cascade": {
+        "nvme_read_bytes": 384,
+        "nvme_write_bytes": 192,
+        "hit_tiers": [
+          "nvme",
+          "nvme",
+          "nvme",
+          "nvme",
+          "nvme",
+          "nvme"
+        ],
+        "tier_hits": {
+          "nvme": 6
+        },
+        "tier_misses": {
+          "cpu": 6,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 0,
+        "promotion_bytes": 384,
+        "replication_bytes": 192,
+        "tier_evictions": {
+          "cpu": 7,
+          "nvme": 0
+        },
+        "cache_misses": 0
+      },
+      "lmcache_source_match": true,
+      "lmcache_disk_io": [
+        [
+          "Write",
+          "a",
+          64
+        ],
+        [
+          "Write",
+          "b",
+          64
+        ],
+        [
+          "Write",
+          "c",
+          64
+        ],
+        [
+          "Read",
+          "a",
+          64
+        ],
+        [
+          "Read",
+          "b",
+          64
+        ],
+        [
+          "Read",
+          "c",
+          64
+        ],
+        [
+          "Read",
+          "a",
+          64
+        ],
+        [
+          "Read",
+          "b",
+          64
+        ],
+        [
+          "Read",
+          "c",
+          64
+        ]
+      ]
+    },
+    "disk_pressure": {
+      "operations": [
+        [
+          "put",
+          "a"
+        ],
+        [
+          "put",
+          "b"
+        ],
+        [
+          "put",
+          "c"
+        ],
+        [
+          "get",
+          "a"
+        ],
+        [
+          "get",
+          "b"
+        ],
+        [
+          "get",
+          "c"
+        ]
+      ],
+      "disk_capacity_bytes": 160,
+      "waterfall": {
+        "nvme_read_bytes": 64,
+        "nvme_write_bytes": 64,
+        "hit_tiers": [
+          "nvme",
+          "cpu",
+          "cpu"
+        ],
+        "tier_hits": {
+          "nvme": 1,
+          "cpu": 2
+        },
+        "tier_misses": {
+          "cpu": 1,
+          "nvme": 0
+        },
+        "eviction_io_bytes": 128,
+        "promotion_bytes": 0,
+        "replication_bytes": 0,
+        "tier_evictions": {
+          "cpu": 1,
+          "nvme": 0
+        },
+        "cache_misses": 0
+      },
+      "cascade": {
+        "nvme_read_bytes": 0,
+        "nvme_write_bytes": 192,
+        "hit_tiers": [
+          null,
+          "cpu",
+          "cpu"
+        ],
+        "tier_hits": {
+          "miss": 1,
+          "cpu": 2
+        },
+        "tier_misses": {
+          "cpu": 1,
+          "nvme": 1
+        },
+        "eviction_io_bytes": 0,
+        "promotion_bytes": 0,
+        "replication_bytes": 192,
+        "tier_evictions": {
+          "cpu": 1,
+          "nvme": 1
+        },
+        "cache_misses": 1
+      },
+      "lmcache_source_match": true,
+      "lmcache_disk_io": [
+        [
+          "Write",
+          "a",
+          64
+        ],
+        [
+          "Write",
+          "b",
+          64
+        ],
+        [
+          "Write",
+          "c",
+          64
+        ]
+      ]
+    }
+  },
+  "source_harness": {
+    "method_file_sha256": "52d933c7c588f29f7915ae83b76ff90d023acd2872ba146f89eb3d50bd8a4d7b",
+    "revision_label": "8c77a6f77b4029269199de39c6f509944294c968",
+    "pinned_design_revision": "8c77a6f77b4029269199de39c6f509944294c968",
+    "scope": "actual LMCache batched_put/get methods; CPU/disk backend doubles"
+  },
+  "vllm_source_harness": {
+    "method_file_sha256": "abaccebe49eefb639ca7a9526bd1fc4627cf418e5579f74f8662db0ba673bffd",
+    "scope": "actual vLLM complete_store method; transfer/request doubles; fan-out contract only",
+    "cases": [
+      {
+        "primary_success": true,
+        "admitted": [
+          true,
+          true
+        ],
+        "secondary_jobs": [
+          0,
+          1
+        ]
+      },
+      {
+        "primary_success": false,
+        "admitted": [
+          true,
+          true
+        ],
+        "secondary_jobs": []
+      },
+      {
+        "primary_success": true,
+        "admitted": [
+          true,
+          false
+        ],
+        "secondary_jobs": [
+          0
+        ]
+      }
+    ]
+  }
+}

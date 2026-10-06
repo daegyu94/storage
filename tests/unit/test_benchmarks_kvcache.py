@@ -430,6 +430,21 @@ def _make_run_benchmark(tmp_path, what_if=False):
     return bm
 
 
+def test_tiering_policy_forwarding_and_metadata(tmp_path):
+    bm = _make_run_benchmark(tmp_path)
+    bm.args.tiering_policy = 'cascade'
+    assert '--tiering-policy' in bm._build_global_kvcache_args(is_closed=False)
+    assert bm._global_workload_features(is_closed=False)['tiering_policy'] == 'cascade'
+    assert bm._build_global_kvcache_args(is_closed=True) == []
+    assert bm._global_workload_features(is_closed=True) == {}
+
+
+def test_default_tiering_does_not_change_suite_invocation(tmp_path):
+    bm = _make_run_benchmark(tmp_path)
+    assert '--tiering-policy' not in bm._build_global_kvcache_args(is_closed=False)
+    assert 'tiering_policy' not in bm._global_workload_features(is_closed=False)
+
+
 class TestInterruptibleSleep:
     """Tests for KVCacheBenchmark._interruptible_sleep."""
 

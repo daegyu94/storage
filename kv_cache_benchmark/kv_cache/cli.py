@@ -330,6 +330,9 @@ def main():
                         help='Total CPU DRAM to allocate for the KV cache spill tier in GiB.')
     parser.add_argument('--cache-dir', type=str, default=None,
                         help='The directory to use for the NVMe cache tier.')
+    parser.add_argument('--tiering-policy', choices=['waterfall', 'cascade'], default=None,
+                        help='Experimental placement policy; default: waterfall. '
+                             'cascade requires CPU staging and replicates stores to NVMe.')
     parser.add_argument('--generation-mode', type=str, default='realistic', choices=[g.value for g in GenerationMode],
                         help='The token generation speed simulation mode.')
     parser.add_argument('--performance-profile', type=str, default='latency', choices=['latency', 'throughput'],
@@ -480,6 +483,7 @@ def main():
         prefill_only=args.prefill_only,
         decode_only=args.decode_only,
         io_trace_log=args.io_trace_log,
+        tiering_policy=args.tiering_policy or cfg('tiering', 'policy', default='waterfall'),
         enable_latency_tracing=args.enable_latency_tracing
     )
 

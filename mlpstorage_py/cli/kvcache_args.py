@@ -279,6 +279,10 @@ def _add_kvcache_open_args(parser):
     """
     run_group = parser.add_argument_group("Open Run Configuration")
     run_group.add_argument(
+        '--tiering-policy', choices=['waterfall', 'cascade'], default=None,
+        help='Experimental KV placement model (default: waterfall); unavailable in CLOSED.'
+    )
+    run_group.add_argument(
         '--duration', '-d',
         type=int,
         default=KVCACHE_DEFAULT_DURATION,

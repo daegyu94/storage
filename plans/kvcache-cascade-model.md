@@ -13,6 +13,10 @@ Source revisions inspected on 2026-10-06:
 - vLLM `main`: `b2863c0de953204b64e4e3d184f96eac26bd5b46`.
 - LMCache `dev`: `8c77a6f77b4029269199de39c6f509944294c968`.
 
+The PR branch was subsequently moved onto the fork's original `main`, `ab2b2e9d8dcb2b2cb499e66c163bfba572153e16`, when the fork's fast-forwarded experimental work was restored to individual branches.
+The benchmark cache, CLI, and wrapper files used by this change are identical between that base and the initially investigated `01273ba` revision.
+The cascade branch therefore contains only this design and implementation, without the separate Agent RL extensions.
+
 ### Existing benchmark
 
 `kv_cache/cache.py:MultiTierCache` stores one `location` per key.

@@ -580,6 +580,7 @@ class KVCacheBenchmark(Benchmark):
         ('enable_latency_tracing', '--enable-latency-tracing'),
     )
     _GLOBAL_VALUE_FLAGS = (
+        ('tiering_policy', '--tiering-policy'),
         ('rag_num_docs', '--rag-num-docs'),
         ('autoscaler_mode', '--autoscaler-mode'),
         ('performance_profile', '--performance-profile'),

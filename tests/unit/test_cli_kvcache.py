@@ -16,6 +16,23 @@ from mlpstorage_py.cli.kvcache_args import add_kvcache_arguments
 from mlpstorage_py.config import EXEC_TYPE, KVCACHE_MODELS
 
 
+@pytest.mark.parametrize('mode', ['open', 'whatif'])
+def test_tiering_policy_is_available_outside_closed(mode):
+    parser = argparse.ArgumentParser()
+    add_kvcache_arguments(parser, mode)
+    base = ['run', '--results-dir', '/tmp', '--systemname', 'sys-v1']
+    assert parser.parse_args(base).tiering_policy is None
+    assert parser.parse_args(base + ['--tiering-policy', 'cascade']).tiering_policy == 'cascade'
+
+
+def test_closed_rejects_tiering_override():
+    parser = argparse.ArgumentParser()
+    add_kvcache_arguments(parser, 'closed')
+    with pytest.raises(SystemExit):
+        parser.parse_args(['run', '--results-dir', '/tmp', '--systemname', 'sys-v1',
+                           '--tiering-policy', 'cascade'])
+
+
 class TestKVCacheSubcommands:
     """Tests for KV cache subcommand structure."""
 

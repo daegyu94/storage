@@ -5,6 +5,12 @@ During LLM inference, models store intermediate attention data in a structure ca
 
 This benchmark simulates this offloading behavior. It generates realistic multi-user inference workloads and measures how your storage performs under pressure. Detailed design documentation can be found in the [DESIGN.md](DESIGN.md) file.
 
+## Experimental cascade tiering
+
+Use `--tiering-policy cascade` for CPU-primary replication and read-through reuse experiments.
+The existing waterfall policy remains the default, and CLOSED workloads are unchanged.
+See [cascade usage and limits](docs/cascade_tiering.md) and the [validation report](vllm_lmcache_validate/cascade_validation.md).
+
 # Usage
 The KV cache benchmark runs three distinct workloads using two model sizes:
 

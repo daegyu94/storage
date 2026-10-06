@@ -17,7 +17,8 @@ Output format (one row per operation):
     Key              Cache entry identifier — use as the object name /
                      file path in the replay tool (e.g. S3 key, fio filename)
     Phase            'Prefill' (initial write), 'Decode' (per-token read),
-                     or 'Evict' (tier-demotion read/write pair)
+                     'Evict' (waterfall demotion), 'Replicate' (cascade
+                     fan-out), or 'Promote' (cascade read-through population)
 
 Tier mapping:
     Tier-0  = GPU VRAM
@@ -136,7 +137,8 @@ class IOTracer:
                         Links writes to their subsequent reads — essential for
                         accurate workload replay with warp / sai3-bench / fio.
             phase:      Inference phase: 'Prefill' (initial write), 'Decode'
-                        (per-token read), or 'Evict' (tier demotion pair).
+                        (per-token read), 'Evict' (tier demotion pair),
+                        'Replicate' (fan-out), or 'Promote' (read-through).
         """
         if self._closed:
             return
