@@ -439,6 +439,14 @@ def test_background_store_returns_with_cpu_ready_and_fs_pending(tmp_path):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("execution", ["caller_await", "background"])
+def test_trace_transfer_pipeline_matches_store_execution(tmp_path, execution):
+    summary, trace, _ = execute(tmp_path, config(fs_execution=execution))
+    expected = "background_cpu_pinned" if execution == "background" else "caller_awaits_completion"
+    assert summary["kv_offload_tiers"]["transfer_pipeline"] == expected
+    assert trace["kv_offload_tiers"]["transfer_pipeline"] == expected
+
+
 def test_background_full_staging_drops_store_without_blocking_generation(tmp_path):
     async def scenario():
         started, release = asyncio.Event(), asyncio.Event()
@@ -552,6 +560,86 @@ def test_background_cpu_only_has_no_tasks_or_files(tmp_path):
     asyncio.run(scenario())
 
 
+def test_background_batch_larger_than_cpu_is_rejected_without_partial_store(tmp_path):
+    async def scenario():
+        cpu, _, operations, _ = tier(tmp_path, background=True)
+        assert await cpu.store_batch(["a", "b"]) is False
+        assert not cpu.entries and not operations and not cpu.pending
+        assert cpu.summary()["cpu_store_skipped"] == 2
+
+    asyncio.run(scenario())
+
+
+def test_background_batch_protects_reused_keys_and_rejects_without_eviction(tmp_path):
+    async def scenario():
+        cpu, _, operations, _ = tier(tmp_path, pages=2, background=True)
+        await cpu.store("a")
+        await cpu.store("b")
+        await cpu.drain()
+        assert await cpu.store_batch(["a", "c", "d"]) is False
+        assert list(cpu.entries) == ["a", "b"] and cpu.evictions == 0
+        assert await cpu.store_batch(["a", "c"]) is True
+        assert set(cpu.entries) == {"a", "c"}
+        await cpu.drain()
+        assert operations == [("write", key, 32) for key in ("a", "b", "c")]
+
+    asyncio.run(scenario())
+
+
+def test_background_batch_full_pins_keep_ready_keys_and_reject_new_copy(tmp_path):
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def hold(op, key):
+            started.set()
+            await release.wait()
+
+        cpu, _, _, _ = tier(tmp_path, pages=2, background=True, workers=1, hold=hold)
+        assert await cpu.store_batch(["a", "b"]) is True
+        await started.wait()
+        assert await cpu.store_batch(["a", "c"]) is False
+        assert set(cpu.entries) == {"a", "b"} and await cpu.load("a")
+        assert cpu.summary()["fs_pending_stores"] == 2
+        release.set()
+        await cpu.drain()
+
+    asyncio.run(scenario())
+
+
+def test_background_rejected_publish_retries_after_cpu_pin_release(tmp_path):
+    from kv_cache.agentrl import create_lifecycle
+
+    async def scenario():
+        runner = create_lifecycle(
+            config(cpu_capacity_bytes=512, fs_execution="background", offload_prompt_only=False),
+            tmp_path / "data",
+            tmp_path / "results",
+        )
+        pool = runner.make_cache_pool(0, NVMeBackend(str(tmp_path / "kv")))
+        release = asyncio.Event()
+        original = pool.tiers.io
+
+        async def hold(*args, **kwargs):
+            await release.wait()
+            return await original(*args, **kwargs)
+
+        pool.tiers.io = hold
+        async with pool.lease(0, "r", None, 0, 2, 4, iteration=0) as lease:
+            for history in (2, 4, 6):
+                pool.materialize(lease, history)
+                await pool.publish(lease, history, prompt_tokens=2)
+            assert len(pool.published["r"][1]) == 2
+            assert pool.tiers.summary()["cpu_store_skipped"] == 1
+            release.set()
+            await pool.tiers.drain()
+            await pool.publish(lease, 6, prompt_tokens=2)
+            await pool.tiers.drain()
+            assert len(pool.published["r"][1]) == 3
+            assert pool.tiers.summary()["fs_write_ops"] == 3
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     "field,value", [("fs_execution", "unknown"), ("fs_write_workers", 0), ("fs_write_workers", True)]
 )
@@ -615,3 +703,22 @@ def test_background_secondary_failure_aborts_sync_before_policy_install(tmp_path
     with pytest.raises(RuntimeError, match="secondary"):
         runner.run()
     assert not any(e["event"] == "policy_install" and e["policy"] > 0 for e in runner.trace.events)
+
+
+def test_background_sync_checkpoint_recovery_and_corruption(tmp_path):
+    from kv_cache.agentrl_trace import analyze_trace
+
+    settings = config(fs_execution="background", cpu_capacity_bytes=4096)
+    _, _, original = execute(tmp_path / "original", settings)
+    manifest = original.storage_dir / "checkpoints/step-1/manifest.json"
+    summary, trace, restored = execute(tmp_path / "resumed", settings, resume=manifest)
+    assert summary["final_policy_version"] == 2
+    assert min(e["iteration"] for e in trace["events"] if e["event"] == "rollout_start") == 1
+    assert summary["io_totals"]["checkpoint_read"]["payload_bytes"] == settings.checkpoint_bytes_per_rank
+    assert summary["kv_offload_tiers"]["transfer_pipeline"] == "background_cpu_pinned"
+    assert not analyze_trace(trace)["violations"]
+    assert all(pool.tiers.summary()["fs_pending_stores"] == 0 for pool in restored.cache_pools.values())
+    metadata = json.loads(manifest.read_text())
+    (manifest.parent / metadata["shards"][0]["path"]).write_bytes(b"broken")
+    with pytest.raises(RuntimeError, match="checkpoint|checksum"):
+        execute(tmp_path / "corrupt", settings, resume=manifest)

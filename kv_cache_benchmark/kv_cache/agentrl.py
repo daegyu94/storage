@@ -1167,11 +1167,14 @@ class SyncLifecycle:
         if self.config.kv_offload_tiers is not None:
             from kv_cache.agentrl_tiering import TierSettings
 
+            settings = TierSettings.parse(self.config.kv_offload_tiers)
             result["kv_offload_tiers"] = {
-                "settings": asdict(TierSettings.parse(self.config.kv_offload_tiers)),
+                "settings": asdict(settings),
                 "store_trigger": "completed_block_cpu_cascade",
                 "cpu_residency_model": "metadata_only",
-                "transfer_pipeline": "caller_awaits_completion",
+                "transfer_pipeline": "background_cpu_pinned"
+                if settings.fs_execution == "background"
+                else "caller_awaits_completion",
                 "fidelity": "uncalibrated",
             }
         return result

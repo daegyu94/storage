@@ -74,7 +74,7 @@ class CPUPrimary:
         self.queue_wait_s = 0.0
         self.store_sequence = 0
 
-    async def reserve(self, key, *, ready, context, wait=True):
+    async def reserve(self, key, *, ready, context):
         async with self.condition:
             waiting = False
             while True:
@@ -94,8 +94,6 @@ class CPUPrimary:
                         self.evictions += 1
                         self.emit("cpu_cache_evict", key=victim, bytes=self.page_bytes, **context)
                         continue
-                if not wait:
-                    return None, False
                 if not waiting:
                     self.waits += 1
                     waiting = True
@@ -143,22 +141,49 @@ class CPUPrimary:
             raise self.failure
 
     async def background_store(self, key, context):
+        return await self.store_batch([key], **context)
+
+    async def store_batch(self, keys, **context):
+        if self.settings.fs_execution != "background":
+            for key in keys:
+                await self.store(key, **context)
+            return True
         for completed_key, completed in list(self.pending.items()):
             if completed.done():
                 self.pending.pop(completed_key)
         self.check_failure()
-        entry, created = await self.reserve(key, ready=True, context=context, wait=False)
-        if entry is None:
-            self.store_skipped += 1
-            self.emit("cpu_store_skip", key=key, bytes=self.page_bytes, reason="pinned_capacity", **context)
-            return False
-        if not created:
-            return True
-        self.stores += 1
-        self.emit("cpu_store_ready", key=key, bytes=self.page_bytes, **context)
-        if not self.settings.fs_enabled or key in self.fs_keys:
-            await self.unpin(entry)
-            return True
+        keys = list(dict.fromkeys(keys))
+        async with self.condition:
+            new_keys = [key for key in keys if key not in self.entries]
+            needed = max(0, len(self.entries) + len(new_keys) - self.pages)
+            victims = [key for key, entry in self.entries.items() if not entry.pins and key not in keys]
+            if needed > len(victims):
+                reason = "batch_capacity" if len(new_keys) > self.pages else "pinned_or_protected_capacity"
+                for key in new_keys:
+                    self.store_skipped += 1
+                    self.emit("cpu_store_skip", key=key, bytes=self.page_bytes, reason=reason, **context)
+                return False
+            for key in victims[:needed]:
+                self.entries.pop(key)
+                self.evictions += 1
+                self.emit("cpu_cache_evict", key=key, bytes=self.page_bytes, **context)
+            created = []
+            for key in keys:
+                if key not in self.entries:
+                    entry = self.entries[key] = CPUBlock(ready=True)
+                    created.append((key, entry))
+                self.entries.move_to_end(key)
+            self.peak = max(self.peak, len(self.entries) * self.page_bytes)
+        for key, entry in created:
+            self.stores += 1
+            self.emit("cpu_store_ready", key=key, bytes=self.page_bytes, **context)
+            if not self.settings.fs_enabled or key in self.fs_keys:
+                await self.unpin(entry)
+            else:
+                self.submit_store(key, entry, context)
+        return True
+
+    def submit_store(self, key, entry, context):
         sequence = self.store_sequence
         self.store_sequence += 1
         submitted = time.monotonic()
@@ -174,7 +199,6 @@ class CPUPrimary:
                 task.exception()  # The failure is latched for store/load/drain.
 
         task.add_done_callback(settled)
-        return True
 
     async def cascade(self, key, entry, sequence, submitted, context):
         success = False

@@ -493,6 +493,9 @@ kv_offload_tiers:
 The default `fs_execution: caller_await` preserves the existing path.
 Opt-in `background` returns after CPU staging admission and performs real FS writes concurrently, with at most `fs_write_workers` active writes per owner.
 CPU slots stay pinned until completion, and full pinned staging skips new stores instead of forcing every generation to wait.
+Completed new-store batches are admitted atomically while protecting their reused CPU keys from eviction.
+Rejected batches leave the publication cursor unchanged and are retried at later synthetic publish boundaries.
+Skipped-store counters count rejected block-attempts, including retries, rather than unique lost blocks.
 Backlog is bounded by CPU page count, and a CPU hit may serve a block while its FS write is pending.
 Missing copies follow the existing cache miss/re-prefill path; reads/promotions still await storage.
 
@@ -502,6 +505,6 @@ Failed writes cannot become valid FS hits, and background errors propagate throu
 Trace events include `cpu_store_skip`, `fs_store_submit/begin/end` and `offload_drain_begin/end`.
 Owner summaries expose skipped payloads, pending/active peaks, executor wait and failed-store counts.
 
-This admission/pinning model follows the vLLM v0.29 CPU manager contract but does not reproduce DMA, scheduler-step batch admission, native priority pools or newer latency-based proportional throttling.
+This admission/pinning model follows the vLLM v0.29 CPU manager contract but does not reproduce DMA, scheduler-step timing, native priority pools or newer latency-based proportional throttling.
 Policy invalidation and physical GC remain conservative: native secondary FS retention/cache namespaces require further trace validation.
 All results remain `uncalibrated`.

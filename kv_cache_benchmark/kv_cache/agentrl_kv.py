@@ -224,8 +224,16 @@ class KVPool:
         stored = previous[1]
         limit = prompt_tokens if self.tiers.settings.offload_prompt_only else history
         eligible = self.plan(lease.policy, lease.request, lease.prefix_id, lease.prefix_tokens, limit)
-        for key, (_, size) in eligible.items():
-            if key not in stored and size == self.page_bytes and self.entries[key].size == self.page_bytes:
+        keys = [
+            key
+            for key, (_, size) in eligible.items()
+            if key not in stored and size == self.page_bytes and self.entries[key].size == self.page_bytes
+        ]
+        if self.tiers.settings.fs_execution == "background":
+            if await self.tiers.store_batch(keys, **lease.context):
+                stored.update(keys)
+        else:
+            for key in keys:
                 await self.tiers.store(key, **lease.context)
                 stored.add(key)
 

@@ -375,7 +375,7 @@ def test_split_owner_failure_propagates_without_complete_summary(tmp_path, monke
     profile = make_profile(split_reference(), grouped=True)
     config = replace(mpi_tests.config_for_mpi(), request_profile=profile)
     monkeypatch.setattr(mpi_tests, "config_for_mpi", lambda: config)
-    mpi_tests.test_mpi_role_failure_never_hangs_or_publishes_complete_summary(tmp_path, target)
+    mpi_tests.test_mpi_role_failure_never_hangs_or_publishes_complete_summary(tmp_path, target, background=False)
 
 
 def test_cancel_during_actual_kv_write_conserves_completed_generation(tmp_path):
